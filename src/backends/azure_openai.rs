@@ -6,7 +6,7 @@
 use crate::{
     builder::LLMBackend,
     chat::Tool,
-    chat::{ChatMessage, ChatProvider, ChatRole, MessageType, StructuredOutputFormat},
+    chat::{ChatMessage, ChatProvider, ChatRole, MessageType, StreamResponse, StructuredOutputFormat},
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
     error::LLMError,
@@ -21,8 +21,10 @@ use crate::{
 };
 use async_trait::async_trait;
 use either::*;
+use futures::{Stream, StreamExt};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
+use std::pin::Pin;
 
 /// Client for interacting with Azure OpenAI's API.
 ///
@@ -167,16 +169,24 @@ struct OpenAIEmbeddingRequest {
     dimensions: Option<u32>,
 }
 
+/// Stream options for Azure OpenAI's chat API endpoint.
+#[derive(Serialize, Debug)]
+struct AzureStreamOptions {
+    include_usage: bool,
+}
+
 /// Request payload for Azure OpenAI's chat API endpoint.
 #[derive(Serialize, Debug)]
 struct AzureOpenAIChatRequest<'a> {
     model: &'a str,
     messages: Vec<AzureOpenAIChatMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
+    max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<AzureStreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -381,44 +391,24 @@ impl AzureOpenAI {
             json_schema,
         }
     }
-}
-
-#[async_trait]
-impl ChatProvider for AzureOpenAI {
-    /// Sends a chat request to OpenAI's API.
+    /// Prepares the list of Azure OpenAI chat messages from the given conversation history.
     ///
-    /// # Arguments
-    ///
-    /// * `messages` - Slice of chat messages representing the conversation
-    /// * `tools` - Optional slice of tools to use in the chat
-    /// # Returns
-    ///
-    /// The model's response text or an error
-    async fn chat_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
-        if self.api_key.is_empty() {
-            return Err(LLMError::AuthError(
-                "Missing Azure OpenAI API key".to_string(),
-            ));
-        }
-
+    /// Handles tool results, image URLs, and inserts the system prompt at the front.
+    fn prepare_messages<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+    ) -> Vec<AzureOpenAIChatMessage<'a>> {
         let mut openai_msgs: Vec<AzureOpenAIChatMessage> = vec![];
 
         for msg in messages {
             if let MessageType::ToolResult(ref results) = msg.message_type {
                 for result in results {
-                    openai_msgs.push(
-                        // Clone strings to own them
-                        AzureOpenAIChatMessage {
-                            role: "tool",
-                            tool_call_id: Some(result.id.clone()),
-                            tool_calls: None,
-                            content: Some(Right(result.function.arguments.clone())),
-                        },
-                    );
+                    openai_msgs.push(AzureOpenAIChatMessage {
+                        role: "tool",
+                        tool_call_id: Some(result.id.clone()),
+                        tool_calls: None,
+                        content: Some(Right(result.function.arguments.clone())),
+                    });
                 }
             } else {
                 openai_msgs.push(msg.into())
@@ -443,6 +433,49 @@ impl ChatProvider for AzureOpenAI {
             );
         }
 
+        openai_msgs
+    }
+
+    /// Builds the chat/completions URL with the api-version query parameter if set.
+    fn chat_completions_url(&self) -> Result<Url, LLMError> {
+        let mut url = self
+            .base_url
+            .join("chat/completions")
+            .map_err(|e| LLMError::HttpError(e.to_string()))?;
+
+        if let Some(api_version) = &self.api_version {
+            url.query_pairs_mut()
+                .append_pair("api-version", api_version);
+        }
+
+        Ok(url)
+    }
+}
+
+#[async_trait]
+impl ChatProvider for AzureOpenAI {
+    /// Sends a chat request to OpenAI's API.
+    ///
+    /// # Arguments
+    ///
+    /// * `messages` - Slice of chat messages representing the conversation
+    /// * `tools` - Optional slice of tools to use in the chat
+    /// # Returns
+    ///
+    /// The model's response text or an error
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        if self.api_key.is_empty() {
+            return Err(LLMError::AuthError(
+                "Missing Azure OpenAI API key".to_string(),
+            ));
+        }
+
+        let openai_msgs = self.prepare_messages(messages);
+
         // Build the response format object
         let response_format: Option<OpenAIResponseFormat> =
             self.json_schema.clone().map(|s| s.into());
@@ -457,9 +490,10 @@ impl ChatProvider for AzureOpenAI {
         let body = AzureOpenAIChatRequest {
             model: &self.model,
             messages: openai_msgs,
-            max_tokens: self.max_tokens,
+            max_completion_tokens: self.max_tokens,
             temperature: self.temperature,
             stream: false,
+            stream_options: None,
             top_p: self.top_p,
             top_k: self.top_k,
             tools: request_tools,
@@ -474,15 +508,7 @@ impl ChatProvider for AzureOpenAI {
             }
         }
 
-        let mut url = self
-            .base_url
-            .join("chat/completions")
-            .map_err(|e| LLMError::HttpError(e.to_string()))?;
-
-            if let Some(api_version) = &self.api_version {
-                url.query_pairs_mut()
-                    .append_pair("api-version", api_version);
-            }
+        let url = self.chat_completions_url()?;
 
         log::info!("Azure OpenAI HTTP Request {}", url);
         let mut request = self
@@ -526,6 +552,95 @@ impl ChatProvider for AzureOpenAI {
 
     async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError> {
         self.chat_with_tools(messages, None).await
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String, LLMError>> + Send>>, LLMError> {
+        let struct_stream = self.chat_stream_struct(messages).await?;
+        let content_stream = struct_stream.filter_map(|result| async move {
+            match result {
+                Ok(stream_response) => {
+                    if let Some(choice) = stream_response.choices.first() {
+                        if let Some(content) = &choice.delta.content {
+                            if !content.is_empty() {
+                                return Some(Ok(content.clone()));
+                            }
+                        }
+                    }
+                    None
+                }
+                Err(e) => Some(Err(e)),
+            }
+        });
+        Ok(Box::pin(content_stream))
+    }
+
+    async fn chat_stream_struct(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<StreamResponse, LLMError>> + Send>>,
+        LLMError,
+    > {
+        use crate::providers::openai_compatible::create_sse_stream;
+
+        if self.api_key.is_empty() {
+            return Err(LLMError::AuthError(
+                "Missing Azure OpenAI API key".to_string(),
+            ));
+        }
+
+        let openai_msgs = self.prepare_messages(messages);
+
+        let body = AzureOpenAIChatRequest {
+            model: &self.model,
+            messages: openai_msgs,
+            max_completion_tokens: self.max_tokens,
+            temperature: self.temperature,
+            stream: true,
+            stream_options: Some(AzureStreamOptions { include_usage: true }),
+            top_p: self.top_p,
+            top_k: self.top_k,
+            tools: self.tools.clone(),
+            tool_choice: self.tool_choice.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            response_format: None,
+        };
+
+        if log::log_enabled!(log::Level::Trace) {
+            if let Ok(json) = serde_json::to_string(&body) {
+                log::trace!("Azure OpenAI stream request payload: {}", json);
+            }
+        }
+
+        let url = self.chat_completions_url()?;
+
+        log::info!("Azure OpenAI HTTP Request {}", url);
+        let mut request = self
+            .client
+            .post(url)
+            .header("api-key", &self.api_key)
+            .json(&body);
+
+        if let Some(timeout) = self.timeout_seconds {
+            request = request.timeout(std::time::Duration::from_secs(timeout));
+        }
+
+        let response = request.send().await?;
+        log::debug!("Azure OpenAI HTTP status: {}", response.status());
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await?;
+            return Err(LLMError::ResponseFormatError {
+                message: format!("Azure OpenAI API returned error status: {status}"),
+                raw_response: error_text,
+            });
+        }
+
+        Ok(create_sse_stream(response, false))
     }
 }
 
