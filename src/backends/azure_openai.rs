@@ -6,11 +6,12 @@
 use crate::{
     builder::LLMBackend,
     chat::Tool,
-    chat::{ChatMessage, ChatProvider, ChatRole, MessageType, StructuredOutputFormat},
+    chat::{ChatMessage, ChatProvider, ChatRole, MessageType, StreamResponse, StructuredOutputFormat},
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
     error::LLMError,
     models::{ModelListRequest, ModelListResponse, ModelsProvider, StandardModelListResponse},
+    providers::openai_compatible::create_sse_stream,
     stt::SpeechToTextProvider,
     tts::TextToSpeechProvider,
     LLMProvider,
@@ -21,6 +22,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use either::*;
+#[cfg(feature = "azure_openai")]
+use futures::Stream;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 
@@ -522,6 +525,113 @@ impl ChatProvider for AzureOpenAI {
                 raw_response: resp_text,
             }),
         }
+    }
+
+    async fn chat_stream_struct(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<StreamResponse, LLMError>> + Send>>,
+        LLMError,
+    > {
+        if self.api_key.is_empty() {
+            return Err(LLMError::AuthError(
+                "Missing Azure OpenAI API key".to_string(),
+            ));
+        }
+
+        let mut openai_msgs: Vec<AzureOpenAIChatMessage> = vec![];
+
+        for msg in messages {
+            if let MessageType::ToolResult(ref results) = msg.message_type {
+                for result in results {
+                    openai_msgs.push(AzureOpenAIChatMessage {
+                        role: "tool",
+                        tool_call_id: Some(result.id.clone()),
+                        tool_calls: None,
+                        content: Some(Right(result.function.arguments.clone())),
+                    });
+                }
+            } else {
+                openai_msgs.push(msg.into())
+            }
+        }
+
+        if let Some(system) = &self.system {
+            openai_msgs.insert(
+                0,
+                AzureOpenAIChatMessage {
+                    role: "system",
+                    content: Some(Left(vec![AzureMessageContent {
+                        message_type: Some("text"),
+                        text: Some(system),
+                        image_url: None,
+                        tool_call_id: None,
+                        tool_output: None,
+                    }])),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            );
+        }
+
+        let response_format: Option<OpenAIResponseFormat> =
+            self.json_schema.clone().map(|s| s.into());
+
+        let request_tools = self.tools.clone();
+        let request_tool_choice = if request_tools.is_some() {
+            self.tool_choice.clone()
+        } else {
+            None
+        };
+
+        let body = AzureOpenAIChatRequest {
+            model: &self.model,
+            messages: openai_msgs,
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            stream: true,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            tools: request_tools,
+            tool_choice: request_tool_choice,
+            reasoning_effort: self.reasoning_effort.clone(),
+            response_format,
+        };
+
+        let mut url = self
+            .base_url
+            .join("chat/completions")
+            .map_err(|e| LLMError::HttpError(e.to_string()))?;
+
+        if let Some(api_version) = &self.api_version {
+            url.query_pairs_mut()
+                .append_pair("api-version", api_version);
+        }
+
+        log::info!("Azure OpenAI HTTP Request (streaming) {}", url);
+        let mut request = self
+            .client
+            .post(url)
+            .header("api-key", &self.api_key)
+            .json(&body);
+
+        if let Some(timeout) = self.timeout_seconds {
+            request = request.timeout(std::time::Duration::from_secs(timeout));
+        }
+
+        let response = request.send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await?;
+            return Err(LLMError::ResponseFormatError {
+                message: format!("Azure OpenAI API returned error status: {status}"),
+                raw_response: error_text,
+            });
+        }
+
+        Ok(create_sse_stream(response, false))
     }
 
     async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError> {
