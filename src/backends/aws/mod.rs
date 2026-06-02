@@ -10,8 +10,10 @@ use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_bedrockruntime::{
     types::{
-        CachePointBlock, CachePointType, ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole, ConverseStreamOutput,
-        Message, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock,
+        CachePointBlock, CachePointType, ContentBlock, ContentBlockDelta, ContentBlockStart,
+        ConversationRole, ConverseStreamOutput, JsonSchemaDefinition, Message,
+        OutputConfig, OutputFormat, OutputFormatStructure, OutputFormatType,
+        SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock,
         ToolResultContentBlock, ToolUseBlock,
     },
     Client as BedrockClient,
@@ -81,6 +83,7 @@ struct PreparedChatRequest {
     system: Option<SystemContentBlock>,
     tool_config: Option<ToolConfiguration>,
     inference_config: aws_sdk_bedrockruntime::types::InferenceConfiguration,
+    output_config: Option<OutputConfig>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -329,6 +332,7 @@ impl BedrockBackend {
             system,
             tool_config,
             inference_config,
+            output_config,
         } = self.prepare_chat_request(request)?;
 
         let mut converse_request = client
@@ -344,6 +348,11 @@ impl BedrockBackend {
         // Add tools if provided
         if let Some(tool_config) = tool_config {
             converse_request = converse_request.tool_config(tool_config);
+        }
+
+        // Add native structured output config if provided
+        if let Some(output_config) = output_config {
+            converse_request = converse_request.output_config(output_config);
         }
 
         // Add inference configuration
@@ -498,6 +507,7 @@ impl BedrockBackend {
             system,
             tool_config,
             inference_config,
+            output_config,
         } = self.prepare_chat_request(request)?;
 
         let mut converse_request = client
@@ -513,6 +523,11 @@ impl BedrockBackend {
         // Add tools if provided
         if let Some(tool_config) = tool_config {
             converse_request = converse_request.tool_config(tool_config);
+        }
+
+        // Add native structured output config if provided
+        if let Some(output_config) = output_config {
+            converse_request = converse_request.output_config(output_config);
         }
 
         // Add inference configuration
@@ -590,6 +605,7 @@ impl BedrockBackend {
             system,
             tool_config,
             inference_config,
+            output_config,
         } = self.prepare_chat_request(request)?;
 
         let mut converse_request = client
@@ -603,6 +619,10 @@ impl BedrockBackend {
 
         if let Some(tool_config) = tool_config {
             converse_request = converse_request.tool_config(tool_config);
+        }
+
+        if let Some(output_config) = output_config {
+            converse_request = converse_request.output_config(output_config);
         }
 
         converse_request = converse_request.inference_config(inference_config);
@@ -798,28 +818,77 @@ impl BedrockBackend {
         }
 
         let mut tool_choice = self.tool_choice.clone();
+        let mut output_config: Option<OutputConfig> = None;
+
         if let Some(response_format) = self.json_schema.as_ref() {
-            let schema = response_format.schema.clone().ok_or_else(|| {
-                BedrockError::InvalidRequest(
-                    "Structured output format must contain a schema".to_string(),
-                )
-            })?;
-
-            let input_schema = ToolInputSchema::Json(Self::value_to_document(&schema));
-
-            let tool_spec = aws_sdk_bedrockruntime::types::ToolSpecification::builder()
-                .name("json_schema_tool")
-                .description(
-                    "Generates structured output in JSON format according to the provided schema.",
-                )
-                .input_schema(input_schema)
-                .build()
-                .map_err(|e| {
-                    BedrockError::InvalidRequest(format!("Failed to build tool spec: {:?}", e))
+            if self.model_supports(&model_id, ModelCapability::NativeStructuredOutput) {
+                // Use Bedrock Converse native structured output (outputConfig.textFormat).
+                // The response will be JSON text directly – no tool call unwrapping needed.
+                let schema = response_format.schema.clone().ok_or_else(|| {
+                    BedrockError::InvalidRequest(
+                        "Structured output format must contain a schema".to_string(),
+                    )
+                })?;
+                let schema_str = serde_json::to_string(&schema).map_err(|e| {
+                    BedrockError::InvalidRequest(format!("Failed to serialize schema: {}", e))
                 })?;
 
-            bedrock_tools.push(Tool::ToolSpec(tool_spec));
-            tool_choice = Some(LlmToolChoice::Tool("json_schema_tool".to_string()));
+                let mut json_schema_builder =
+                    JsonSchemaDefinition::builder().schema(schema_str);
+                if !response_format.name.is_empty() {
+                    json_schema_builder = json_schema_builder.name(&response_format.name);
+                }
+                if let Some(desc) = &response_format.description {
+                    json_schema_builder = json_schema_builder.description(desc);
+                }
+
+                let json_schema_def = json_schema_builder.build().map_err(|e| {
+                    BedrockError::InvalidRequest(format!(
+                        "Failed to build JSON schema definition: {:?}",
+                        e
+                    ))
+                })?;
+
+                let output_format = OutputFormat::builder()
+                    .r#type(OutputFormatType::JsonSchema)
+                    .structure(OutputFormatStructure::JsonSchema(json_schema_def))
+                    .build()
+                    .map_err(|e| {
+                        BedrockError::InvalidRequest(format!(
+                            "Failed to build output format: {:?}",
+                            e
+                        ))
+                    })?;
+
+                output_config = Some(
+                    OutputConfig::builder()
+                        .text_format(output_format)
+                        .build(),
+                );
+            } else {
+                // Fallback: tool-based structured output for models without native support.
+                let schema = response_format.schema.clone().ok_or_else(|| {
+                    BedrockError::InvalidRequest(
+                        "Structured output format must contain a schema".to_string(),
+                    )
+                })?;
+
+                let input_schema = ToolInputSchema::Json(Self::value_to_document(&schema));
+
+                let tool_spec = aws_sdk_bedrockruntime::types::ToolSpecification::builder()
+                    .name("json_schema_tool")
+                    .description(
+                        "Generates structured output in JSON format according to the provided schema.",
+                    )
+                    .input_schema(input_schema)
+                    .build()
+                    .map_err(|e| {
+                        BedrockError::InvalidRequest(format!("Failed to build tool spec: {:?}", e))
+                    })?;
+
+                bedrock_tools.push(Tool::ToolSpec(tool_spec));
+                tool_choice = Some(LlmToolChoice::Tool("json_schema_tool".to_string()));
+            }
         }
 
         if let Some(tools) = &self.tools {
@@ -905,6 +974,7 @@ impl BedrockBackend {
             system,
             tool_config,
             inference_config,
+            output_config,
         })
     }
 
