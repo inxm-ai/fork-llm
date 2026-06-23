@@ -953,7 +953,7 @@ impl ChatProvider for Anthropic {
 }
 
 /// Creates an SSE stream that parses Anthropic tool use events into StreamChunk.
-fn create_anthropic_tool_stream(
+pub(crate) fn create_anthropic_tool_stream(
     response: reqwest::Response,
 ) -> std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>> {
     use futures::stream::StreamExt;
@@ -1122,7 +1122,7 @@ impl crate::LLMProvider for Anthropic {
 /// * `Ok(Some(String))` - Content token if found
 /// * `Ok(None)` - If chunk should be skipped (e.g., ping, done signal)
 /// * `Err(LLMError)` - If parsing fails
-fn parse_anthropic_sse_chunk(chunk: &str) -> Result<Option<String>, LLMError> {
+pub(crate) fn parse_anthropic_sse_chunk(chunk: &str) -> Result<Option<String>, LLMError> {
     for line in chunk.lines() {
         let line = line.trim();
         if let Some(data) = line.strip_prefix("data: ") {
@@ -1146,7 +1146,7 @@ fn parse_anthropic_sse_chunk(chunk: &str) -> Result<Option<String>, LLMError> {
 
 /// State for tracking tool use blocks during streaming
 #[derive(Debug, Default)]
-struct ToolUseState {
+pub(crate) struct ToolUseState {
     /// Tool ID
     id: String,
     /// Tool name
@@ -1173,7 +1173,7 @@ struct ToolUseState {
 /// * `Ok(Some(StreamChunk))` - A stream chunk if one was parsed
 /// * `Ok(None)` - If chunk should be skipped
 /// * `Err(LLMError)` - If parsing fails
-fn parse_anthropic_sse_chunk_with_tools(
+pub(crate) fn parse_anthropic_sse_chunk_with_tools(
     chunk: &str,
     tool_states: &mut HashMap<usize, ToolUseState>,
 ) -> Result<Option<StreamChunk>, LLMError> {

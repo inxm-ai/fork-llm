@@ -35,6 +35,7 @@ full = [
     "openrouter",
     "huggingface",
     "bedrock",
+    "vertex_ai",
 ]
 openai = []
 anthropic = []
@@ -56,6 +57,7 @@ bedrock = [
     "dep:aws-sdk-bedrockruntime",
     "dep:aws-smithy-types",
 ]
+vertex_ai = []
 cli = [
     "full",
     "dep:anyhow",
