@@ -85,6 +85,17 @@ struct AnthropicTool<'a> {
     cache_control: Option<&'a serde_json::Value>,
 }
 
+/// Claude 5-generation models (Fable 5.1, Opus 5, Sonnet 5, Mythos 5.1) reject
+/// `temperature`/`top_p`/`top_k` outright with a 400 - sampling controls were
+/// removed in favor of adaptive thinking. Older models (Haiku 4.5 and prior)
+/// still accept them. See the Anthropic Messages API model migration notes.
+fn model_supports_sampling_params(model: &str) -> bool {
+    !matches!(
+        model,
+        "claude-sonnet-5" | "claude-opus-5" | "claude-fable-5-1" | "claude-mythos-5-1"
+    )
+}
+
 /// Configuration for the thinking feature
 #[derive(Serialize, Debug)]
 struct ThinkingConfig {
@@ -702,16 +713,17 @@ impl ChatProvider for Anthropic {
         };
 
         let system_prompt = Self::system_to_request(&self.config.system);
+        let supports_sampling = model_supports_sampling_params(&self.config.model);
 
         let req_body = AnthropicCompleteRequest {
             messages: anthropic_messages,
             model: &self.config.model,
             max_tokens: Some(self.config.max_tokens),
-            temperature: Some(self.config.temperature),
+            temperature: supports_sampling.then_some(self.config.temperature),
             system: Some(system_prompt),
             stream: Some(false),
-            top_p: self.config.top_p,
-            top_k: self.config.top_k,
+            top_p: if supports_sampling { self.config.top_p } else { None },
+            top_k: if supports_sampling { self.config.top_k } else { None },
             tools: anthropic_tools,
             tool_choice: final_tool_choice,
             thinking,
@@ -832,16 +844,17 @@ impl ChatProvider for Anthropic {
             .collect();
 
         let system_prompt = Self::system_to_request(&self.config.system);
+        let supports_sampling = model_supports_sampling_params(&self.config.model);
 
         let req_body = AnthropicCompleteRequest {
             messages: anthropic_messages,
             model: &self.config.model,
             max_tokens: Some(self.config.max_tokens),
-            temperature: Some(self.config.temperature),
+            temperature: supports_sampling.then_some(self.config.temperature),
             system: Some(system_prompt),
             stream: Some(true),
-            top_p: self.config.top_p,
-            top_k: self.config.top_k,
+            top_p: if supports_sampling { self.config.top_p } else { None },
+            top_k: if supports_sampling { self.config.top_k } else { None },
             tools: None,
             tool_choice: None,
             thinking: None,
@@ -902,16 +915,17 @@ impl ChatProvider for Anthropic {
         );
 
         let system_prompt = Self::system_to_request(&self.config.system);
+        let supports_sampling = model_supports_sampling_params(&self.config.model);
 
         let req_body = AnthropicCompleteRequest {
             messages: anthropic_messages,
             model: &self.config.model,
             max_tokens: Some(self.config.max_tokens),
-            temperature: Some(self.config.temperature),
+            temperature: supports_sampling.then_some(self.config.temperature),
             system: Some(system_prompt),
             stream: Some(true),
-            top_p: self.config.top_p,
-            top_k: self.config.top_k,
+            top_p: if supports_sampling { self.config.top_p } else { None },
+            top_k: if supports_sampling { self.config.top_k } else { None },
             tools: anthropic_tools,
             tool_choice: final_tool_choice,
             thinking: None, // Thinking not supported with streaming tools
@@ -1635,4 +1649,20 @@ data: {"type": "ping"}
         let anthropic_tools = anthropic_tools.expect("tools should be present");
         assert!(anthropic_tools[0].cache_control.is_none());
     }
+
+    #[test]
+    fn model_supports_sampling_params_rejects_current_generation() {
+        assert!(!model_supports_sampling_params("claude-sonnet-5"));
+        assert!(!model_supports_sampling_params("claude-opus-5"));
+        assert!(!model_supports_sampling_params("claude-fable-5-1"));
+        assert!(!model_supports_sampling_params("claude-mythos-5-1"));
+    }
+
+    #[test]
+    fn model_supports_sampling_params_allows_older_models() {
+        assert!(model_supports_sampling_params("claude-haiku-4-5-20251001"));
+        assert!(model_supports_sampling_params("claude-sonnet-4-6"));
+        assert!(model_supports_sampling_params("claude-opus-4-5-20251101-v1:0"));
+    }
+
 }
