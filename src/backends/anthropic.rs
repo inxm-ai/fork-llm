@@ -39,8 +39,13 @@ pub struct AnthropicConfig {
     pub model: String,
     /// Maximum tokens to generate in responses.
     pub max_tokens: u32,
-    /// Sampling temperature for response randomness.
-    pub temperature: f32,
+    /// Sampling temperature for response randomness. `None` when the caller
+    /// never set one - left unset on the wire rather than defaulted, since
+    /// Claude's 5-generation models (Sonnet 5, Opus 5, Fable 5.1, Mythos 5.1)
+    /// reject `temperature`/`top_p`/`top_k` outright with a 400 (sampling
+    /// controls were replaced by adaptive thinking), while older models still
+    /// accept them.
+    pub temperature: Option<f32>,
     /// Request timeout in seconds.
     pub timeout_seconds: u64,
     /// System prompt to guide model behavior.
@@ -83,17 +88,6 @@ struct AnthropicTool<'a> {
     schema: &'a serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<&'a serde_json::Value>,
-}
-
-/// Claude 5-generation models (Fable 5.1, Opus 5, Sonnet 5, Mythos 5.1) reject
-/// `temperature`/`top_p`/`top_k` outright with a 400 - sampling controls were
-/// removed in favor of adaptive thinking. Older models (Haiku 4.5 and prior)
-/// still accept them. See the Anthropic Messages API model migration notes.
-fn model_supports_sampling_params(model: &str) -> bool {
-    !matches!(
-        model,
-        "claude-sonnet-5" | "claude-opus-5" | "claude-fable-5-1" | "claude-mythos-5-1"
-    )
 }
 
 /// Configuration for the thinking feature
@@ -525,7 +519,7 @@ impl Anthropic {
     /// * `api_key` - Anthropic API key for authentication
     /// * `model` - Model identifier (defaults to "claude-3-sonnet-20240229")
     /// * `max_tokens` - Maximum tokens in response (defaults to 300)
-    /// * `temperature` - Sampling temperature (defaults to 0.7)
+    /// * `temperature` - Sampling temperature; omitted from the request entirely when unset
     /// * `timeout_seconds` - Request timeout in seconds (defaults to 30)
     /// * `system` - System prompt (defaults to "You are a helpful assistant.")
     /// * `thinking_budget_tokens` - Budget tokens for thinking (optional)
@@ -578,7 +572,7 @@ impl Anthropic {
     /// * `api_key` - Anthropic API key for authentication
     /// * `model` - Model identifier (defaults to "claude-3-sonnet-20240229")
     /// * `max_tokens` - Maximum tokens in response (defaults to 300)
-    /// * `temperature` - Sampling temperature (defaults to 0.7)
+    /// * `temperature` - Sampling temperature; omitted from the request entirely when unset
     /// * `timeout_seconds` - Request timeout in seconds (defaults to 30)
     /// * `system` - System prompt (defaults to "You are a helpful assistant.")
     /// * `thinking_budget_tokens` - Budget tokens for thinking (optional)
@@ -603,7 +597,7 @@ impl Anthropic {
                 api_key: api_key.into(),
                 model: model.unwrap_or_else(|| "claude-3-sonnet-20240229".to_string()),
                 max_tokens: max_tokens.unwrap_or(300),
-                temperature: temperature.unwrap_or(0.7),
+                temperature,
                 system: system.unwrap_or_else(|| {
                     SystemPrompt::String("You are a helpful assistant.".to_string())
                 }),
@@ -631,7 +625,7 @@ impl Anthropic {
         self.config.max_tokens
     }
 
-    pub fn temperature(&self) -> f32 {
+    pub fn temperature(&self) -> Option<f32> {
         self.config.temperature
     }
 
@@ -713,17 +707,16 @@ impl ChatProvider for Anthropic {
         };
 
         let system_prompt = Self::system_to_request(&self.config.system);
-        let supports_sampling = model_supports_sampling_params(&self.config.model);
 
         let req_body = AnthropicCompleteRequest {
             messages: anthropic_messages,
             model: &self.config.model,
             max_tokens: Some(self.config.max_tokens),
-            temperature: supports_sampling.then_some(self.config.temperature),
+            temperature: self.config.temperature,
             system: Some(system_prompt),
             stream: Some(false),
-            top_p: if supports_sampling { self.config.top_p } else { None },
-            top_k: if supports_sampling { self.config.top_k } else { None },
+            top_p: self.config.top_p,
+            top_k: self.config.top_k,
             tools: anthropic_tools,
             tool_choice: final_tool_choice,
             thinking,
@@ -844,17 +837,16 @@ impl ChatProvider for Anthropic {
             .collect();
 
         let system_prompt = Self::system_to_request(&self.config.system);
-        let supports_sampling = model_supports_sampling_params(&self.config.model);
 
         let req_body = AnthropicCompleteRequest {
             messages: anthropic_messages,
             model: &self.config.model,
             max_tokens: Some(self.config.max_tokens),
-            temperature: supports_sampling.then_some(self.config.temperature),
+            temperature: self.config.temperature,
             system: Some(system_prompt),
             stream: Some(true),
-            top_p: if supports_sampling { self.config.top_p } else { None },
-            top_k: if supports_sampling { self.config.top_k } else { None },
+            top_p: self.config.top_p,
+            top_k: self.config.top_k,
             tools: None,
             tool_choice: None,
             thinking: None,
@@ -915,17 +907,16 @@ impl ChatProvider for Anthropic {
         );
 
         let system_prompt = Self::system_to_request(&self.config.system);
-        let supports_sampling = model_supports_sampling_params(&self.config.model);
 
         let req_body = AnthropicCompleteRequest {
             messages: anthropic_messages,
             model: &self.config.model,
             max_tokens: Some(self.config.max_tokens),
-            temperature: supports_sampling.then_some(self.config.temperature),
+            temperature: self.config.temperature,
             system: Some(system_prompt),
             stream: Some(true),
-            top_p: if supports_sampling { self.config.top_p } else { None },
-            top_k: if supports_sampling { self.config.top_k } else { None },
+            top_p: self.config.top_p,
+            top_k: self.config.top_k,
             tools: anthropic_tools,
             tool_choice: final_tool_choice,
             thinking: None, // Thinking not supported with streaming tools
@@ -1651,18 +1642,46 @@ data: {"type": "ping"}
     }
 
     #[test]
-    fn model_supports_sampling_params_rejects_current_generation() {
-        assert!(!model_supports_sampling_params("claude-sonnet-5"));
-        assert!(!model_supports_sampling_params("claude-opus-5"));
-        assert!(!model_supports_sampling_params("claude-fable-5-1"));
-        assert!(!model_supports_sampling_params("claude-mythos-5-1"));
+    fn request_omits_temperature_top_p_top_k_when_unset() {
+        let req_body = AnthropicCompleteRequest {
+            messages: vec![],
+            model: "claude-sonnet-5",
+            max_tokens: Some(64),
+            temperature: None,
+            system: None,
+            stream: Some(false),
+            top_p: None,
+            top_k: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+        };
+
+        let json = serde_json::to_value(&req_body).unwrap();
+        assert!(json.get("temperature").is_none());
+        assert!(json.get("top_p").is_none());
+        assert!(json.get("top_k").is_none());
     }
 
     #[test]
-    fn model_supports_sampling_params_allows_older_models() {
-        assert!(model_supports_sampling_params("claude-haiku-4-5-20251001"));
-        assert!(model_supports_sampling_params("claude-sonnet-4-6"));
-        assert!(model_supports_sampling_params("claude-opus-4-5-20251101-v1:0"));
-    }
+    fn request_includes_temperature_top_p_top_k_when_explicitly_set() {
+        let req_body = AnthropicCompleteRequest {
+            messages: vec![],
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: Some(64),
+            temperature: Some(0.0),
+            system: None,
+            stream: Some(false),
+            top_p: Some(0.5),
+            top_k: Some(40),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+        };
 
+        let json = serde_json::to_value(&req_body).unwrap();
+        assert_eq!(json.get("temperature").unwrap(), 0.0);
+        assert_eq!(json.get("top_p").unwrap(), 0.5);
+        assert_eq!(json.get("top_k").unwrap(), 40);
+    }
 }
