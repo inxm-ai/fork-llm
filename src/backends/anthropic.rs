@@ -31,7 +31,7 @@ use serde_json::Value;
 ///
 /// This struct holds all configuration options and is wrapped in an `Arc`
 /// to enable cheap cloning of the `Anthropic` client.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AnthropicConfig {
     /// API key for authentication with Anthropic.
     pub api_key: String,
@@ -62,6 +62,8 @@ pub struct AnthropicConfig {
     pub reasoning: bool,
     /// Budget tokens for extended thinking.
     pub thinking_budget_tokens: Option<u32>,
+    /// Native structured output configuration sent to the Messages API.
+    pub output_config: Option<Value>,
 }
 
 /// Client for interacting with Anthropic's API.
@@ -129,6 +131,8 @@ struct AnthropicCompleteRequest<'a> {
     tool_choice: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<&'a Value>,
 }
 
 /// Individual message in an Anthropic chat conversation.
@@ -608,9 +612,27 @@ impl Anthropic {
                 tool_choice,
                 reasoning: reasoning.unwrap_or(false),
                 thinking_budget_tokens,
+                output_config: None,
             }),
             client,
         }
+    }
+
+    /// Configure native JSON outputs. Unsupported schemas are rejected by the API;
+    /// they are never silently downgraded to unconstrained text.
+    pub fn with_structured_output(
+        mut self,
+        format: crate::chat::StructuredOutputFormat,
+    ) -> Result<Self, LLMError> {
+        let schema = format.schema.ok_or_else(|| {
+            LLMError::InvalidRequest(
+                "Anthropic structured output requires an explicit JSON schema".to_string(),
+            )
+        })?;
+        Arc::make_mut(&mut self.config).output_config = Some(serde_json::json!({
+            "format": {"type": "json_schema", "schema": schema}
+        }));
+        Ok(self)
     }
 
     pub fn api_key(&self) -> &str {
@@ -720,6 +742,7 @@ impl ChatProvider for Anthropic {
             tools: anthropic_tools,
             tool_choice: final_tool_choice,
             thinking,
+            output_config: self.config.output_config.as_ref(),
         };
 
         let mut request = self
@@ -850,6 +873,7 @@ impl ChatProvider for Anthropic {
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: self.config.output_config.as_ref(),
         };
 
         let mut request = self
@@ -919,6 +943,7 @@ impl ChatProvider for Anthropic {
             top_k: self.config.top_k,
             tools: anthropic_tools,
             tool_choice: final_tool_choice,
+            output_config: self.config.output_config.as_ref(),
             thinking: None, // Thinking not supported with streaming tools
         };
 
@@ -1286,6 +1311,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn structured_output_preserves_nested_required_fields_on_wire() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"steps": {"type": "array", "items": {
+                "type": "object",
+                "properties": {"description": {"type": "string"}},
+                "required": ["description"],
+                "additionalProperties": false
+            }}},
+            "required": ["steps"],
+            "additionalProperties": false
+        });
+        let provider = Anthropic::new(
+            "test-key", None, None, None, None, None, None, None, None, None, None, None,
+        )
+        .with_structured_output(crate::chat::StructuredOutputFormat {
+            name: "draft".to_string(),
+            description: None,
+            schema: Some(schema.clone()),
+            strict: Some(true),
+        })
+        .unwrap();
+        for streaming in [false, true] {
+            let request = AnthropicCompleteRequest {
+                messages: vec![],
+                model: &provider.config.model,
+                max_tokens: Some(provider.config.max_tokens),
+                temperature: None,
+                system: None,
+                stream: Some(streaming),
+                top_p: None,
+                top_k: None,
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                output_config: provider.config.output_config.as_ref(),
+            };
+            let wire = serde_json::to_value(request).unwrap();
+            assert_eq!(wire["output_config"]["format"]["type"], "json_schema");
+            assert_eq!(wire["output_config"]["format"]["schema"], schema);
+            assert!(wire.get("response_format").is_none());
+        }
+    }
+
+    #[test]
+    fn builder_rejects_schema_less_structured_output_instead_of_dropping_it() {
+        let result = crate::builder::LLMBuilder::new()
+            .backend(crate::builder::LLMBackend::Anthropic)
+            .api_key("test-key")
+            .schema(crate::chat::StructuredOutputFormat {
+                name: "json_object".to_string(),
+                description: None,
+                schema: None,
+                strict: Some(true),
+            })
+            .build();
+        assert!(matches!(result, Err(LLMError::InvalidRequest(message))
+            if message.contains("explicit JSON schema")));
+    }
+
+    #[test]
     fn test_parse_stream_text_delta() {
         let chunk = r#"event: content_block_delta
 data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}}
@@ -1611,8 +1697,7 @@ data: {"type": "ping"}
             cache_control: Some(serde_json::json!({"type": "ephemeral"})),
         }];
 
-        let (anthropic_tools, _) =
-            Anthropic::prepare_tools_and_choice(Some(&tools), None, &None);
+        let (anthropic_tools, _) = Anthropic::prepare_tools_and_choice(Some(&tools), None, &None);
 
         let anthropic_tools = anthropic_tools.expect("tools should be present");
         assert_eq!(anthropic_tools.len(), 1);
@@ -1634,8 +1719,7 @@ data: {"type": "ping"}
             cache_control: None,
         }];
 
-        let (anthropic_tools, _) =
-            Anthropic::prepare_tools_and_choice(Some(&tools), None, &None);
+        let (anthropic_tools, _) = Anthropic::prepare_tools_and_choice(Some(&tools), None, &None);
 
         let anthropic_tools = anthropic_tools.expect("tools should be present");
         assert!(anthropic_tools[0].cache_control.is_none());
@@ -1655,12 +1739,14 @@ data: {"type": "ping"}
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
         };
 
         let json = serde_json::to_value(&req_body).unwrap();
         assert!(json.get("temperature").is_none());
         assert!(json.get("top_p").is_none());
         assert!(json.get("top_k").is_none());
+        assert!(json.get("output_config").is_none());
     }
 
     #[test]
@@ -1677,6 +1763,7 @@ data: {"type": "ping"}
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
         };
 
         let json = serde_json::to_value(&req_body).unwrap();

@@ -35,6 +35,10 @@ pub(super) fn build_anthropic(
         state.reasoning_budget_tokens,
     );
 
+    let provider = match state.json_schema.take() {
+        Some(format) => provider.with_structured_output(format)?,
+        None => provider,
+    };
     Ok(Box::new(provider))
 }
 
