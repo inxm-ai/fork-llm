@@ -27,6 +27,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod structured_output;
+
 /// Configuration for the Anthropic client.
 ///
 /// This struct holds all configuration options and is wrapped in an `Arc`
@@ -64,6 +66,9 @@ pub struct AnthropicConfig {
     pub thinking_budget_tokens: Option<u32>,
     /// Native structured output configuration sent to the Messages API.
     pub output_config: Option<Value>,
+    /// Original constraints enforced locally when the native schema is adapted.
+    /// These requests are buffered before exposing streaming output.
+    pub output_validator: Option<Arc<jsonschema::JSONSchema>>,
 }
 
 /// Client for interacting with Anthropic's API.
@@ -613,13 +618,16 @@ impl Anthropic {
                 reasoning: reasoning.unwrap_or(false),
                 thinking_budget_tokens,
                 output_config: None,
+                output_validator: None,
             }),
             client,
         }
     }
 
-    /// Configure native JSON outputs. Unsupported schemas are rejected by the API;
-    /// they are never silently downgraded to unconstrained text.
+    /// Configure native JSON outputs. String/array upper bounds unsupported by
+    /// Anthropic are moved into descriptions and enforced locally against the
+    /// original schema. Adapted outputs are buffered before streaming to callers.
+    /// Other unsupported schemas are still rejected rather than downgraded to text.
     pub fn with_structured_output(
         mut self,
         format: crate::chat::StructuredOutputFormat,
@@ -629,10 +637,53 @@ impl Anthropic {
                 "Anthropic structured output requires an explicit JSON schema".to_string(),
             )
         })?;
-        Arc::make_mut(&mut self.config).output_config = Some(serde_json::json!({
-            "format": {"type": "json_schema", "schema": schema}
+        let wire_schema = structured_output::adapt_schema(&schema);
+        let validator = if wire_schema != schema {
+            Some(Arc::new(jsonschema::JSONSchema::compile(&schema).map_err(
+                |error| {
+                    LLMError::InvalidRequest(format!("Invalid Anthropic output schema: {error}"))
+                },
+            )?))
+        } else {
+            None
+        };
+        let config = Arc::make_mut(&mut self.config);
+        config.output_config = Some(serde_json::json!({
+            "format": {"type": "json_schema", "schema": wire_schema}
         }));
+        config.output_validator = validator;
         Ok(self)
+    }
+
+    async fn parse_completion_response(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<AnthropicCompleteResponse, LLMError> {
+        let status = response.status();
+        let request_id = response
+            .headers()
+            .get("request-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("unknown")
+            .to_owned();
+        let body = response.text().await?;
+        if !status.is_success() {
+            // Preserve the provider diagnosis before consuming the response;
+            // retain HttpError so existing gateway status mapping stays intact.
+            return Err(LLMError::HttpError(format!(
+                "Anthropic API returned {status} (request-id: {request_id}): {body}"
+            )));
+        }
+        let parsed: AnthropicCompleteResponse = serde_json::from_str(&body)
+            .map_err(|error| LLMError::HttpError(format!("Failed to parse JSON: {error}")))?;
+        if let Some(validator) = self.config.output_validator.as_ref() {
+            // Tool calls are intermediate turns, not the final structured output.
+            let has_tool_calls = parsed.tool_calls().is_some_and(|calls| !calls.is_empty());
+            if !has_tool_calls {
+                structured_output::validate_output(validator, &parsed.text().unwrap_or_default())?;
+            }
+        }
+        Ok(parsed)
     }
 
     pub fn api_key(&self) -> &str {
@@ -767,11 +818,7 @@ impl ChatProvider for Anthropic {
         let resp = request.send().await?;
         log::debug!("Anthropic HTTP status: {}", resp.status());
 
-        let resp = resp.error_for_status()?;
-
-        let body = resp.text().await?;
-        let json_resp: AnthropicCompleteResponse = serde_json::from_str(&body)
-            .map_err(|e| LLMError::HttpError(format!("Failed to parse JSON: {e}")))?;
+        let json_resp = self.parse_completion_response(resp).await?;
         Ok(Box::new(json_resp))
     }
 
@@ -803,6 +850,12 @@ impl ChatProvider for Anthropic {
     ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<String, LLMError>> + Send>>, LLMError>
     {
         crate::chat::ensure_no_audio(messages, AUDIO_UNSUPPORTED)?;
+        if self.config.output_validator.is_some() {
+            let response = self.chat_with_tools(messages, None).await?;
+            return Ok(Box::pin(futures::stream::iter(vec![Ok(response
+                .text()
+                .unwrap_or_default())])));
+        }
         if self.config.api_key.is_empty() {
             return Err(LLMError::AuthError("Missing Anthropic API key".to_string()));
         }
@@ -919,6 +972,32 @@ impl ChatProvider for Anthropic {
         tools: Option<&[Tool]>,
     ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
     {
+        if self.config.output_validator.is_some() {
+            let response = self.chat_with_tools(messages, tools).await?;
+            let mut chunks = vec![Ok(StreamChunk::Text(response.text().unwrap_or_default()))];
+            let calls = response.tool_calls().unwrap_or_default();
+            let stop_reason = if calls.is_empty() {
+                "end_turn"
+            } else {
+                "tool_use"
+            };
+            for (index, tool_call) in calls.into_iter().enumerate() {
+                chunks.push(Ok(StreamChunk::ToolUseStart {
+                    index,
+                    id: tool_call.id.clone(),
+                    name: tool_call.function.name.clone(),
+                }));
+                chunks.push(Ok(StreamChunk::ToolUseInputDelta {
+                    index,
+                    partial_json: tool_call.function.arguments.clone(),
+                }));
+                chunks.push(Ok(StreamChunk::ToolUseComplete { index, tool_call }));
+            }
+            chunks.push(Ok(StreamChunk::Done {
+                stop_reason: stop_reason.into(),
+            }));
+            return Ok(Box::pin(futures::stream::iter(chunks)));
+        }
         if self.config.api_key.is_empty() {
             return Err(LLMError::AuthError("Missing Anthropic API key".to_string()));
         }
@@ -1309,6 +1388,104 @@ pub(crate) fn parse_anthropic_sse_chunk_with_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bounded_output_provider() -> Anthropic {
+        Anthropic::new(
+            "test-key", None, None, None, None, None, None, None, None, None, None, None,
+        ).with_structured_output(crate::chat::StructuredOutputFormat {
+            name: "draft".into(), description: None, strict: Some(true),
+            schema: Some(serde_json::json!({
+                "type": "object", "properties": {
+                    "steps": {"type": "array", "maxItems": 1, "items": {"type": "string", "maxLength": 3}}
+                }, "required": ["steps"], "additionalProperties": false
+            })),
+        }).unwrap()
+    }
+
+    fn completion_response(text: &str) -> reqwest::Response {
+        http::Response::builder()
+            .status(http::StatusCode::OK)
+            .body(serde_json::json!({"content": [{"type": "text", "text": text}]}).to_string())
+            .unwrap()
+            .into()
+    }
+
+    #[tokio::test]
+    async fn adapted_completion_is_validated_before_returning_to_caller() {
+        let provider = bounded_output_provider();
+        let valid = provider
+            .parse_completion_response(completion_response(r#"{"steps":["ok"]}"#))
+            .await
+            .unwrap();
+        assert_eq!(valid.text().unwrap(), r#"{"steps":["ok"]}"#);
+        for invalid in [r#"{"steps":["too long"]}"#, r#"{"steps":["a","b"]}"#, "{"] {
+            assert!(matches!(
+                provider
+                    .parse_completion_response(completion_response(invalid))
+                    .await,
+                Err(LLMError::ProviderError(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn non_streaming_rejection_preserves_anthropic_diagnosis_and_request_id() {
+        let body = serde_json::json!({"type": "error", "error": {
+            "type": "invalid_request_error",
+            "message": "output_config.format.schema: For 'array' type, property 'maxItems' is not supported"
+        }}).to_string();
+        let response = http::Response::builder()
+            .status(http::StatusCode::BAD_REQUEST)
+            .header("request-id", "req_test_schema")
+            .body(body)
+            .unwrap()
+            .into();
+        let error = bounded_output_provider()
+            .parse_completion_response(response)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, LLMError::HttpError(_)));
+        let message = error.to_string();
+        for detail in [
+            "400 Bad Request",
+            "req_test_schema",
+            "invalid_request_error",
+            "maxItems",
+        ] {
+            assert!(message.contains(detail), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn adapted_output_allows_intermediate_tool_calls() {
+        let body = serde_json::json!({"content": [{
+            "type": "tool_use", "id": "tool_test", "name": "lookup", "input": {"query": "customer"}
+        }]})
+        .to_string();
+        let response = http::Response::builder()
+            .status(http::StatusCode::OK)
+            .body(body)
+            .unwrap()
+            .into();
+        let parsed = bounded_output_provider()
+            .parse_completion_response(response)
+            .await
+            .unwrap();
+        assert_eq!(parsed.tool_calls().unwrap()[0].function.name, "lookup");
+    }
+
+    #[test]
+    fn replacing_adapted_schema_clears_buffered_validation() {
+        let provider = bounded_output_provider();
+        assert!(provider.config.output_validator.is_some());
+        let original = provider.clone();
+        let updated = provider.with_structured_output(crate::chat::StructuredOutputFormat {
+            name: "plain".into(), description: None, strict: Some(true),
+            schema: Some(serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})),
+        }).unwrap();
+        assert!(updated.config.output_validator.is_none());
+        assert!(original.config.output_validator.is_some());
+    }
 
     #[test]
     fn structured_output_preserves_nested_required_fields_on_wire() {
