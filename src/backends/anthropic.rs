@@ -918,12 +918,6 @@ impl ChatProvider for Anthropic {
     ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<String, LLMError>> + Send>>, LLMError>
     {
         crate::chat::ensure_no_audio(messages, AUDIO_UNSUPPORTED)?;
-        if self.config.output_validator.is_some() {
-            let response = self.chat_with_tools(messages, None).await?;
-            return Ok(Box::pin(futures::stream::iter(vec![Ok(response
-                .text()
-                .unwrap_or_default())])));
-        }
         if self.config.api_key.is_empty() {
             return Err(LLMError::AuthError("Missing Anthropic API key".to_string()));
         }
@@ -980,7 +974,15 @@ impl ChatProvider for Anthropic {
             })
             .collect();
 
-        let system_prompt = Self::system_to_request(&self.config.system);
+        let owned_system_prompt = self
+            .config
+            .output_schema_instruction
+            .as_deref()
+            .map(|instruction| Self::system_with_schema_instruction(&self.config.system, instruction));
+        let system_prompt = match &owned_system_prompt {
+            Some(owned) => owned.as_request(),
+            None => Self::system_to_request(&self.config.system),
+        };
 
         let req_body = AnthropicCompleteRequest {
             messages: anthropic_messages,
@@ -1018,10 +1020,11 @@ impl ChatProvider for Anthropic {
                 raw_response: error_text,
             });
         }
-        Ok(crate::chat::create_sse_stream(
-            response,
-            parse_anthropic_sse_chunk,
-        ))
+        let stream = crate::chat::create_sse_stream(response, parse_anthropic_sse_chunk);
+        Ok(match self.config.output_validator.clone() {
+            Some(validator) => wrap_text_stream_with_validation(stream, validator),
+            None => stream,
+        })
     }
 
     /// Sends a streaming chat request with tool support.
@@ -1040,32 +1043,6 @@ impl ChatProvider for Anthropic {
         tools: Option<&[Tool]>,
     ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
     {
-        if self.config.output_validator.is_some() {
-            let response = self.chat_with_tools(messages, tools).await?;
-            let mut chunks = vec![Ok(StreamChunk::Text(response.text().unwrap_or_default()))];
-            let calls = response.tool_calls().unwrap_or_default();
-            let stop_reason = if calls.is_empty() {
-                "end_turn"
-            } else {
-                "tool_use"
-            };
-            for (index, tool_call) in calls.into_iter().enumerate() {
-                chunks.push(Ok(StreamChunk::ToolUseStart {
-                    index,
-                    id: tool_call.id.clone(),
-                    name: tool_call.function.name.clone(),
-                }));
-                chunks.push(Ok(StreamChunk::ToolUseInputDelta {
-                    index,
-                    partial_json: tool_call.function.arguments.clone(),
-                }));
-                chunks.push(Ok(StreamChunk::ToolUseComplete { index, tool_call }));
-            }
-            chunks.push(Ok(StreamChunk::Done {
-                stop_reason: stop_reason.into(),
-            }));
-            return Ok(Box::pin(futures::stream::iter(chunks)));
-        }
         if self.config.api_key.is_empty() {
             return Err(LLMError::AuthError("Missing Anthropic API key".to_string()));
         }
@@ -1077,7 +1054,15 @@ impl ChatProvider for Anthropic {
             &self.config.tool_choice,
         );
 
-        let system_prompt = Self::system_to_request(&self.config.system);
+        let owned_system_prompt = self
+            .config
+            .output_schema_instruction
+            .as_deref()
+            .map(|instruction| Self::system_with_schema_instruction(&self.config.system, instruction));
+        let system_prompt = match &owned_system_prompt {
+            Some(owned) => owned.as_request(),
+            None => Self::system_to_request(&self.config.system),
+        };
 
         let req_body = AnthropicCompleteRequest {
             messages: anthropic_messages,
@@ -1125,8 +1110,114 @@ impl ChatProvider for Anthropic {
             });
         }
 
-        Ok(create_anthropic_tool_stream(response))
+        let stream = create_anthropic_tool_stream(response);
+        Ok(match self.config.output_validator.clone() {
+            Some(validator) => wrap_tool_stream_with_validation(stream, validator),
+            None => stream,
+        })
     }
+}
+
+/// Wraps a text-delta stream so the accumulated text is validated against the
+/// original schema once the stream ends (used for the prompt-based /
+/// bounds-adapted structured output fallback, see `with_structured_output`).
+/// On success the stream is unchanged; on failure one extra `Err` item is
+/// emitted after the last chunk instead of silently returning invalid JSON.
+fn wrap_text_stream_with_validation(
+    inner: std::pin::Pin<Box<dyn Stream<Item = Result<String, LLMError>> + Send>>,
+    validator: Arc<jsonschema::JSONSchema>,
+) -> std::pin::Pin<Box<dyn Stream<Item = Result<String, LLMError>> + Send>> {
+    use futures::stream::StreamExt;
+
+    struct State {
+        inner: std::pin::Pin<Box<dyn Stream<Item = Result<String, LLMError>> + Send>>,
+        buffer: String,
+        ended: bool,
+    }
+
+    let state = State {
+        inner,
+        buffer: String::new(),
+        ended: false,
+    };
+
+    Box::pin(futures::stream::unfold(state, move |mut state| {
+        let validator = validator.clone();
+        async move {
+            if state.ended {
+                return None;
+            }
+            match state.inner.next().await {
+                Some(Ok(text)) => {
+                    state.buffer.push_str(&text);
+                    Some((Ok(text), state))
+                }
+                Some(Err(error)) => Some((Err(error), state)),
+                None => {
+                    state.ended = true;
+                    match structured_output::validate_output(&validator, &state.buffer) {
+                        Ok(()) => None,
+                        Err(error) => Some((Err(error), state)),
+                    }
+                }
+            }
+        }
+    }))
+}
+
+/// Wraps a tool-use stream so the accumulated text response is validated
+/// against the original schema right before the `Done` chunk is emitted (used
+/// for the prompt-based / bounds-adapted structured output fallback, see
+/// `with_structured_output`). Intermediate tool calls are never the final
+/// structured output, so a stream that produced any `ToolUseComplete` chunk
+/// skips validation, matching the non-streaming behavior.
+fn wrap_tool_stream_with_validation(
+    inner: std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
+    validator: Arc<jsonschema::JSONSchema>,
+) -> std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>> {
+    use futures::stream::StreamExt;
+
+    struct State {
+        inner: std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
+        text: String,
+        has_tool_calls: bool,
+    }
+
+    let state = State {
+        inner,
+        text: String::new(),
+        has_tool_calls: false,
+    };
+
+    Box::pin(futures::stream::unfold(state, move |mut state| {
+        let validator = validator.clone();
+        async move {
+            match state.inner.next().await {
+                Some(Ok(StreamChunk::Text(text))) => {
+                    state.text.push_str(&text);
+                    Some((Ok(StreamChunk::Text(text)), state))
+                }
+                Some(Ok(StreamChunk::ToolUseComplete { index, tool_call })) => {
+                    state.has_tool_calls = true;
+                    Some((Ok(StreamChunk::ToolUseComplete { index, tool_call }), state))
+                }
+                Some(Ok(StreamChunk::Done { stop_reason })) => {
+                    let result = if state.has_tool_calls {
+                        Ok(StreamChunk::Done { stop_reason })
+                    } else {
+                        match structured_output::validate_output(&validator, &state.text) {
+                            Ok(()) => Ok(StreamChunk::Done { stop_reason }),
+                            Err(error) => Err(error),
+                        }
+                    };
+                    Some((result, state))
+                }
+                Some(Ok(other)) => Some((Ok(other), state)),
+                Some(Err(error)) => Some((Err(error), state)),
+                None => None,
+            }
+        }
+    }))
 }
 
 /// Creates an SSE stream that parses Anthropic tool use events into StreamChunk.
@@ -2104,5 +2195,120 @@ data: {"type": "ping"}
         assert_eq!(json.get("temperature").unwrap(), 0.0);
         assert_eq!(json.get("top_p").unwrap(), 0.5);
         assert_eq!(json.get("top_k").unwrap(), 40);
+    }
+
+    fn draft_validator() -> Arc<jsonschema::JSONSchema> {
+        Arc::new(
+            jsonschema::JSONSchema::compile(&serde_json::json!({
+                "type": "object", "properties": {
+                    "steps": {"type": "array", "maxItems": 1, "items": {"type": "string", "maxLength": 3}}
+                }, "required": ["steps"], "additionalProperties": false
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn text_stream_validation_passes_chunks_through_as_they_arrive() {
+        use futures::stream::StreamExt;
+
+        let inner = Box::pin(futures::stream::iter(vec![
+            Ok(r#"{"steps":["#.to_string()),
+            Ok(r#""ok"]}"#.to_string()),
+        ]));
+        let mut stream = wrap_text_stream_with_validation(inner, draft_validator());
+        assert_eq!(stream.next().await.unwrap().unwrap(), r#"{"steps":["#);
+        assert_eq!(stream.next().await.unwrap().unwrap(), r#""ok"]}"#);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn text_stream_validation_emits_trailing_error_for_invalid_json() {
+        use futures::stream::StreamExt;
+
+        let inner = Box::pin(futures::stream::iter(vec![Ok(
+            r#"{"steps":["too long"]}"#.to_string()
+        )]));
+        let mut stream = wrap_text_stream_with_validation(inner, draft_validator());
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            r#"{"steps":["too long"]}"#
+        );
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(LLMError::ProviderError(_)))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_stream_validation_passes_valid_output_through_unchanged() {
+        use futures::stream::StreamExt;
+
+        let inner = Box::pin(futures::stream::iter(vec![
+            Ok(StreamChunk::Text(r#"{"steps":["ok"]}"#.to_string())),
+            Ok(StreamChunk::Done {
+                stop_reason: "end_turn".to_string(),
+            }),
+        ]));
+        let mut stream = wrap_tool_stream_with_validation(inner, draft_validator());
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            StreamChunk::Text(t) if t == r#"{"steps":["ok"]}"#
+        ));
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            StreamChunk::Done { stop_reason } if stop_reason == "end_turn"
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_stream_validation_replaces_done_with_error_for_invalid_output() {
+        use futures::stream::StreamExt;
+
+        let inner = Box::pin(futures::stream::iter(vec![
+            Ok(StreamChunk::Text(r#"{"steps":["too long"]}"#.to_string())),
+            Ok(StreamChunk::Done {
+                stop_reason: "end_turn".to_string(),
+            }),
+        ]));
+        let mut stream = wrap_tool_stream_with_validation(inner, draft_validator());
+        stream.next().await; // text chunk, streamed through as-is
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(LLMError::ProviderError(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn tool_stream_validation_skips_validation_when_tool_calls_present() {
+        use futures::stream::StreamExt;
+
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "lookup".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let inner = Box::pin(futures::stream::iter(vec![
+            Ok(StreamChunk::Text("not valid per schema".to_string())),
+            Ok(StreamChunk::ToolUseComplete {
+                index: 0,
+                tool_call,
+            }),
+            Ok(StreamChunk::Done {
+                stop_reason: "tool_use".to_string(),
+            }),
+        ]));
+        let mut stream = wrap_tool_stream_with_validation(inner, draft_validator());
+        stream.next().await; // text
+        stream.next().await; // tool use complete
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            StreamChunk::Done { stop_reason } if stop_reason == "tool_use"
+        ));
     }
 }
