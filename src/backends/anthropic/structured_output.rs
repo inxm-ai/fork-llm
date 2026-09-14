@@ -84,6 +84,16 @@ pub(super) fn adapt_schema(schema: &Value) -> Value {
             adapted.insert((*key).into(), child);
         }
     }
+    // Anthropic's native structured output rejects any object schema whose
+    // additionalProperties isn't explicitly false (400: "'additionalProperties'
+    // must be explicitly set to false"), regardless of what the caller's
+    // original schema declared. Force it after the recursive walk above so it
+    // overrides whatever CHILD_SCHEMAS just adapted additionalProperties to.
+    let is_object = fields.get("type").and_then(Value::as_str) == Some("object")
+        || fields.contains_key("properties");
+    if is_object {
+        adapted.insert("additionalProperties".into(), Value::Bool(false));
+    }
     Value::Object(adapted)
 }
 
@@ -175,5 +185,25 @@ mod tests {
         assert!(adapted["properties"]["maxLength"].get("maxItems").is_none());
         assert_eq!(adapted["examples"], schema["examples"]);
         assert_eq!(adapted["const"], schema["const"]);
+    }
+
+    #[test]
+    fn forces_additional_properties_false_on_every_object_even_when_absent_or_true() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "user": {
+                    "properties": {"id": {"type": "string"}}
+                },
+                "meta": {"type": "object", "additionalProperties": true}
+            }
+        });
+        let adapted = adapt_schema(&schema);
+        assert_eq!(adapted["additionalProperties"], false);
+        assert_eq!(adapted["properties"]["user"]["additionalProperties"], false);
+        assert_eq!(adapted["properties"]["meta"]["additionalProperties"], false);
+        // Non-object schemas are untouched.
+        let string_schema = json!({"type": "string"});
+        assert!(adapt_schema(&string_schema).get("additionalProperties").is_none());
     }
 }
