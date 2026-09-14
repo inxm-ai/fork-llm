@@ -1,23 +1,36 @@
 name: Bump app-tgi-core
 
-# fork-llm has no release/tag process (see the Tests workflow) - a green run
-# of Tests on main is the closest thing to a "release" event. When that
-# happens, open (or update) a PR in app-tgi-core that bumps the `llm` git
-# pin in app/Cargo.lock to the commit that just passed, via the shared
-# GitHub App used for other cross-repo PRs (see cli-inxm's release.yml).
+# fork-llm has no release/tag process, and the existing Tests workflow
+# (.github/workflows/test.yml) isn't registered/running on this repo as of
+# 2026-09-14 (0 runs, absent from the Actions workflow list) for reasons
+# unclear from the repo settings alone - so this workflow does not depend on
+# it. It verifies main itself, then opens (or updates) a PR in app-tgi-core
+# bumping the `llm` git pin in app/Cargo.lock to the commit that just built
+# and tested cleanly, via the same GitHub App used for cross-repo PRs in
+# cli-inxm's release.yml.
 on:
-  workflow_run:
-    workflows: ["Tests"]
-    types: [completed]
+  push:
     branches: [main]
 
 permissions:
   contents: read
 
 jobs:
+  verify:
+    name: Build and test main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ALSA development libraries
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: rustup update
+      - run: cargo clippy --all --all-targets --all-features
+      - run: cargo test
+      - run: cargo build --release
+
   bump-pin:
     name: Open PR bumping the fork-llm pin in app-tgi-core
-    if: github.event.workflow_run.conclusion == 'success'
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - name: Generate app installation token
@@ -40,10 +53,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Bump the llm pin to the fork-llm commit that just passed Tests
+      - name: Bump the llm pin to the fork-llm commit that just passed verify
         working-directory: app-tgi-core/app
         env:
-          FORK_LLM_SHA: ${{ github.event.workflow_run.head_sha }}
+          FORK_LLM_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           cargo update -p llm --precise "${FORK_LLM_SHA}"
@@ -54,16 +67,16 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           path: app-tgi-core
           add-paths: app/Cargo.lock
-          commit-message: "chore(deps): bump fork-llm pin to ${{ github.event.workflow_run.head_sha }}"
+          commit-message: "chore(deps): bump fork-llm pin to ${{ github.sha }}"
           branch: chore/bump-fork-llm-pin
           delete-branch: true
           title: "chore(deps): bump fork-llm pin"
           body: |
             Bumps the `llm` git dependency pin in `app/Cargo.lock` to
-            [inxm-ai/fork-llm@${{ github.event.workflow_run.head_sha }}](https://github.com/inxm-ai/fork-llm/commit/${{ github.event.workflow_run.head_sha }}),
+            [inxm-ai/fork-llm@${{ github.sha }}](https://github.com/inxm-ai/fork-llm/commit/${{ github.sha }}),
             picking up the fork-llm changes that just merged to `main`.
 
-            Opened automatically once fork-llm's `Tests` workflow passed on
+            Opened automatically after fork-llm's own build+test passed on
             that commit; review the linked fork-llm commit(s) for behavior
             changes before merging.
           base: main
