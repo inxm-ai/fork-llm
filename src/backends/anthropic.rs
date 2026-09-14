@@ -925,57 +925,7 @@ impl ChatProvider for Anthropic {
             return Err(LLMError::AuthError("Missing Anthropic API key".to_string()));
         }
 
-        let anthropic_messages: Vec<AnthropicMessage> = messages
-            .iter()
-            .map(|m| AnthropicMessage {
-                role: match m.role {
-                    ChatRole::User => "user",
-                    ChatRole::Assistant => "assistant",
-                },
-                content: match &m.message_type {
-                    MessageType::Text => vec![MessageContent {
-                        message_type: Some("text"),
-                        text: Some(&m.content),
-                        image_url: None,
-                        source: None,
-                        tool_use_id: None,
-                        tool_input: None,
-                        tool_name: None,
-                        tool_result_id: None,
-                        tool_output: None,
-                    }],
-                    MessageType::Pdf(_) => unimplemented!(),
-                    MessageType::Image((image_mime, raw_bytes)) => {
-                        vec![MessageContent {
-                            message_type: Some("image"),
-                            text: None,
-                            image_url: None,
-                            source: Some(ImageSource {
-                                source_type: "base64",
-                                media_type: image_mime.mime_type(),
-                                data: BASE64.encode(raw_bytes),
-                            }),
-                            tool_use_id: None,
-                            tool_input: None,
-                            tool_name: None,
-                            tool_result_id: None,
-                            tool_output: None,
-                        }]
-                    }
-                    _ => vec![MessageContent {
-                        message_type: Some("text"),
-                        text: Some(&m.content),
-                        image_url: None,
-                        source: None,
-                        tool_use_id: None,
-                        tool_input: None,
-                        tool_name: None,
-                        tool_result_id: None,
-                        tool_output: None,
-                    }],
-                },
-            })
-            .collect();
+        let anthropic_messages = Self::convert_messages_to_anthropic(messages);
 
         let owned_system_prompt = self
             .config
@@ -2372,5 +2322,19 @@ data: {"type": "ping"}
             Err(LLMError::InvalidRequest(_)) => {}
             other => panic!("expected InvalidRequest, got {}", other.is_ok()),
         }
+    }
+
+    #[test]
+    fn chat_stream_uses_the_shared_message_converter() {
+        // chat_stream used to hand-roll its own conversion, which panicked on
+        // Pdf and silently mis-serialized ImageURL/ToolUse/ToolResult through
+        // a wildcard text case. It now shares convert_messages_to_anthropic
+        // with chat_with_tools/chat_stream_with_tools - assert a Pdf message
+        // (previously `unimplemented!()`) converts instead of panicking.
+        let messages = vec![ChatMessage::user().pdf(vec![1, 2, 3]).build()];
+        let converted = Anthropic::convert_messages_to_anthropic(&messages);
+        let json = serde_json::to_value(&converted).unwrap();
+        assert_eq!(json[0]["content"][0]["type"], "document");
+        assert_eq!(json[0]["content"][0]["source"]["media_type"], "application/pdf");
     }
 }
