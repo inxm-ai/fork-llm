@@ -15,6 +15,14 @@ on:
 permissions:
   contents: read
 
+# Two pushes to main in quick succession would otherwise verify concurrently
+# and both update the single chore/bump-fork-llm-pin branch/PR; a slower run
+# for the older commit could finish last and regress the pin. Cancel a
+# superseded run instead - only the latest commit on main needs a bump.
+concurrency:
+  group: bump-app-tgi-core-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify:
     name: Build and test main

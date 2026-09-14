@@ -124,12 +124,27 @@ pub(super) fn unsupported_native_construct(schema: &Value) -> Option<String> {
             if fields.contains_key("patternProperties") {
                 return Some("'patternProperties'".to_string());
             }
+            // additionalProperties defaults to `true` (open) per JSON Schema
+            // when the keyword is absent, exactly like an explicit `true`
+            // above - so an object with no *named* properties (missing
+            // `properties`, or `properties: {}`) is only genuinely closed,
+            // and safe to hand to adapt_schema, when it explicitly sets
+            // `additionalProperties: false` itself.
             let is_object = fields.get("type").and_then(Value::as_str) == Some("object")
                 || fields.contains_key("properties");
-            if is_object && !fields.contains_key("properties") {
-                return Some(
-                    "an object schema without 'properties' (free-form object)".to_string(),
-                );
+            if is_object {
+                let has_named_properties = fields
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|properties| !properties.is_empty());
+                let explicitly_closed = fields.get("additionalProperties") == Some(&Value::Bool(false));
+                if !has_named_properties && !explicitly_closed {
+                    return Some(
+                        "an object schema with no named properties that isn't explicitly \
+                         closed with additionalProperties: false (free-form object)"
+                            .to_string(),
+                    );
+                }
             }
             for key in SCHEMA_MAPS {
                 if let Some(Value::Object(children)) = fields.get(*key) {
@@ -175,7 +190,7 @@ pub(super) fn unsupported_native_construct(schema: &Value) -> Option<String> {
 /// shown will otherwise guess the shape.
 pub(super) fn schema_prompt_instruction(schema: &Value) -> String {
     format!(
-        "Respond with a single JSON object only - no markdown code fences, no prose before or \
+        "Respond with a single JSON value only - no markdown code fences, no prose before or \
          after it - that satisfies exactly this JSON Schema:\n{}",
         serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string())
     )
@@ -350,5 +365,29 @@ mod tests {
                 "did not expect {schema} to be flagged"
             );
         }
+    }
+
+    #[test]
+    fn flags_empty_properties_without_an_explicit_additional_properties_false() {
+        // Per JSON Schema, `additionalProperties` defaults to `true` (open)
+        // when absent - so `properties: {}` alone (no properties, no
+        // explicit closing) is effectively free-form, not the same as
+        // `properties: {}, additionalProperties: false` above.
+        let schema = json!({"type": "object", "properties": {}});
+        assert!(unsupported_native_construct(&schema).is_some());
+    }
+
+    #[test]
+    fn flags_unsupported_construct_nested_under_a_non_object_root() {
+        let schema = json!({"type": "array", "items": {}});
+        assert!(unsupported_native_construct(&schema).is_some());
+    }
+
+    #[test]
+    fn prompt_instruction_does_not_require_a_json_object_for_non_object_roots() {
+        let instruction = schema_prompt_instruction(&json!({"type": "array", "items": {"type": "string"}}));
+        let lower = instruction.to_lowercase();
+        assert!(lower.contains("json value"));
+        assert!(!lower.contains("json object"));
     }
 }
