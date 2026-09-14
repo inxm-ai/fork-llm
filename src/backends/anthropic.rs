@@ -179,8 +179,6 @@ struct MessageContent<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    image_url: Option<ImageUrlContent<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<ImageSource<'a>>,
     // tool use
     #[serde(skip_serializing_if = "Option::is_none", rename = "id")]
@@ -196,17 +194,19 @@ struct MessageContent<'a> {
     tool_output: Option<String>,
 }
 
+/// Source of an Anthropic `image`/`document` content block. Anthropic's
+/// Messages API expects one of these two shapes - never the OpenAI Chat
+/// Completions `{"type": "image_url", "image_url": {"url": ...}}` form.
 #[derive(Serialize, Debug)]
-struct ImageUrlContent<'a> {
-    url: &'a str,
-}
-
-#[derive(Serialize, Debug)]
-struct ImageSource<'a> {
-    #[serde(rename = "type")]
-    source_type: &'a str,
-    media_type: &'a str,
-    data: String,
+#[serde(tag = "type")]
+enum ImageSource<'a> {
+    #[serde(rename = "base64")]
+    Base64 {
+        media_type: &'a str,
+        data: String,
+    },
+    #[serde(rename = "url")]
+    Url { url: &'a str },
 }
 
 /// Response from Anthropic's messages API endpoint.
@@ -400,7 +400,6 @@ impl Anthropic {
                     MessageType::Text => vec![MessageContent {
                         message_type: Some("text"),
                         text: Some(&m.content),
-                        image_url: None,
                         source: None,
                         tool_use_id: None,
                         tool_input: None,
@@ -412,9 +411,7 @@ impl Anthropic {
                         vec![MessageContent {
                             message_type: Some("document"),
                             text: None,
-                            image_url: None,
-                            source: Some(ImageSource {
-                                source_type: "base64",
+                            source: Some(ImageSource::Base64 {
                                 media_type: "application/pdf",
                                 data: BASE64.encode(raw_bytes),
                             }),
@@ -429,9 +426,7 @@ impl Anthropic {
                         vec![MessageContent {
                             message_type: Some("image"),
                             text: None,
-                            image_url: None,
-                            source: Some(ImageSource {
-                                source_type: "base64",
+                            source: Some(ImageSource::Base64 {
                                 media_type: image_mime.mime_type(),
                                 data: BASE64.encode(raw_bytes),
                             }),
@@ -443,10 +438,9 @@ impl Anthropic {
                         }]
                     }
                     MessageType::ImageURL(ref url) => vec![MessageContent {
-                        message_type: Some("image_url"),
+                        message_type: Some("image"),
                         text: None,
-                        image_url: Some(ImageUrlContent { url }),
-                        source: None,
+                        source: Some(ImageSource::Url { url }),
                         tool_use_id: None,
                         tool_input: None,
                         tool_name: None,
@@ -459,7 +453,6 @@ impl Anthropic {
                         .map(|c| MessageContent {
                             message_type: Some("tool_use"),
                             text: None,
-                            image_url: None,
                             source: None,
                             tool_use_id: Some(c.id.clone()),
                             tool_input: Some(
@@ -476,7 +469,6 @@ impl Anthropic {
                         .map(|r| MessageContent {
                             message_type: Some("tool_result"),
                             text: None,
-                            image_url: None,
                             source: None,
                             tool_use_id: None,
                             tool_input: None,
@@ -557,6 +549,19 @@ impl Anthropic {
                 OwnedSystemPrompt::Messages(msgs)
             }
         }
+    }
+
+    /// Builds the owned system prompt for a request, with the prompt-based
+    /// structured output fallback's schema instruction appended when one is
+    /// configured (see `with_structured_output`). `None` means the plain
+    /// configured system prompt applies as-is - callers fall back to
+    /// `system_to_request` in that case, since `OwnedSystemPrompt` has
+    /// nowhere unowned to borrow from otherwise.
+    fn owned_system_prompt(&self) -> Option<OwnedSystemPrompt> {
+        self.config
+            .output_schema_instruction
+            .as_deref()
+            .map(|instruction| Self::system_with_schema_instruction(&self.config.system, instruction))
     }
 
     /// Creates a new Anthropic client with the specified configuration.
@@ -842,11 +847,7 @@ impl ChatProvider for Anthropic {
             None
         };
 
-        let owned_system_prompt = self
-            .config
-            .output_schema_instruction
-            .as_deref()
-            .map(|instruction| Self::system_with_schema_instruction(&self.config.system, instruction));
+        let owned_system_prompt = self.owned_system_prompt();
         let system_prompt = match &owned_system_prompt {
             Some(owned) => owned.as_request(),
             None => Self::system_to_request(&self.config.system),
@@ -927,11 +928,7 @@ impl ChatProvider for Anthropic {
 
         let anthropic_messages = Self::convert_messages_to_anthropic(messages);
 
-        let owned_system_prompt = self
-            .config
-            .output_schema_instruction
-            .as_deref()
-            .map(|instruction| Self::system_with_schema_instruction(&self.config.system, instruction));
+        let owned_system_prompt = self.owned_system_prompt();
         let system_prompt = match &owned_system_prompt {
             Some(owned) => owned.as_request(),
             None => Self::system_to_request(&self.config.system),
@@ -1008,11 +1005,7 @@ impl ChatProvider for Anthropic {
             &self.config.tool_choice,
         );
 
-        let owned_system_prompt = self
-            .config
-            .output_schema_instruction
-            .as_deref()
-            .map(|instruction| Self::system_with_schema_instruction(&self.config.system, instruction));
+        let owned_system_prompt = self.owned_system_prompt();
         let system_prompt = match &owned_system_prompt {
             Some(owned) => owned.as_request(),
             None => Self::system_to_request(&self.config.system),
@@ -1106,7 +1099,13 @@ fn wrap_text_stream_with_validation(
                     state.buffer.push_str(&text);
                     Some((Ok(text), state))
                 }
-                Some(Err(error)) => Some((Err(error), state)),
+                Some(Err(error)) => {
+                    // A transport error already ends the response; don't run
+                    // validation against a buffer we know is incomplete and
+                    // risk masking the real error with a confusing one.
+                    state.ended = true;
+                    Some((Err(error), state))
+                }
                 None => {
                     state.ended = true;
                     match structured_output::validate_output(&validator, &state.buffer) {
@@ -1175,7 +1174,13 @@ fn wrap_tool_stream_with_validation(
                     Some((result, state))
                 }
                 Some(Ok(other)) => Some((Ok(other), state)),
-                Some(Err(error)) => Some((Err(error), state)),
+                Some(Err(error)) => {
+                    // A transport error already ends the response; don't let
+                    // the next poll's EOF branch also report a missing-Done
+                    // error and mask the real cause.
+                    state.ended = true;
+                    Some((Err(error), state))
+                }
                 None => {
                     state.ended = true;
                     if state.done_seen {
@@ -2224,6 +2229,27 @@ data: {"type": "ping"}
     }
 
     #[tokio::test]
+    async fn text_stream_validation_does_not_mask_a_transport_error_with_a_validation_error() {
+        use futures::stream::StreamExt;
+
+        // A dropped connection mid-response (inner stream yields Err then
+        // ends) must surface only the transport error - not also run
+        // validation against the known-incomplete buffer and append a
+        // second, misleading "invalid JSON" error behind it.
+        let inner = Box::pin(futures::stream::iter(vec![
+            Ok(r#"{"steps":["#.to_string()),
+            Err(LLMError::HttpError("connection reset".to_string())),
+        ]));
+        let mut stream = wrap_text_stream_with_validation(inner, draft_validator());
+        stream.next().await; // partial text chunk, streamed through as-is
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(LLMError::HttpError(_)))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn tool_stream_validation_passes_valid_output_through_unchanged() {
         use futures::stream::StreamExt;
 
@@ -2315,6 +2341,26 @@ data: {"type": "ping"}
     }
 
     #[tokio::test]
+    async fn tool_stream_validation_does_not_mask_a_transport_error_with_a_missing_done_error() {
+        use futures::stream::StreamExt;
+
+        // A dropped connection mid-response (inner stream yields Err then
+        // ends, with no Done chunk) must surface only the transport error -
+        // not also report a separate "stream ended before Done" error.
+        let inner = Box::pin(futures::stream::iter(vec![
+            Ok(StreamChunk::Text(r#"{"steps":["#.to_string())),
+            Err(LLMError::HttpError("connection reset".to_string())),
+        ]));
+        let mut stream = wrap_tool_stream_with_validation(inner, draft_validator());
+        stream.next().await; // text chunk, streamed through as-is
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(LLMError::HttpError(_)))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn chat_stream_with_tools_rejects_audio_messages() {
         let provider = bounded_output_provider();
         let messages = vec![ChatMessage::user().audio(vec![0, 1, 2]).build()];
@@ -2336,5 +2382,23 @@ data: {"type": "ping"}
         let json = serde_json::to_value(&converted).unwrap();
         assert_eq!(json[0]["content"][0]["type"], "document");
         assert_eq!(json[0]["content"][0]["source"]["media_type"], "application/pdf");
+    }
+
+    #[test]
+    fn image_url_serializes_as_anthropic_image_block_not_openai_shape() {
+        // Anthropic's Messages API expects
+        // {"type": "image", "source": {"type": "url", "url": ...}} - not the
+        // OpenAI Chat Completions {"type": "image_url", "image_url": {"url": ...}}
+        // shape this used to emit.
+        let messages = vec![ChatMessage::user()
+            .image_url("https://example.com/cat.png")
+            .build()];
+        let converted = Anthropic::convert_messages_to_anthropic(&messages);
+        let json = serde_json::to_value(&converted).unwrap();
+        let block = &json[0]["content"][0];
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["source"]["type"], "url");
+        assert_eq!(block["source"]["url"], "https://example.com/cat.png");
+        assert!(block.get("image_url").is_none());
     }
 }
