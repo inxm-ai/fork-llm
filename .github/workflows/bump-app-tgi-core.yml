@@ -1,0 +1,69 @@
+name: Bump app-tgi-core
+
+# fork-llm has no release/tag process (see the Tests workflow) - a green run
+# of Tests on main is the closest thing to a "release" event. When that
+# happens, open (or update) a PR in app-tgi-core that bumps the `llm` git
+# pin in app/Cargo.lock to the commit that just passed, via the shared
+# GitHub App used for other cross-repo PRs (see cli-inxm's release.yml).
+on:
+  workflow_run:
+    workflows: ["Tests"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  bump-pin:
+    name: Open PR bumping the fork-llm pin in app-tgi-core
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate app installation token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: inxm-ai
+          repositories: app-tgi-core
+
+      - name: Checkout app-tgi-core
+        uses: actions/checkout@v7
+        with:
+          repository: inxm-ai/app-tgi-core
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+          path: app-tgi-core
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump the llm pin to the fork-llm commit that just passed Tests
+        working-directory: app-tgi-core/app
+        env:
+          FORK_LLM_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          cargo update -p llm --precise "${FORK_LLM_SHA}"
+
+      - name: Create or update the pin-bump PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          path: app-tgi-core
+          add-paths: app/Cargo.lock
+          commit-message: "chore(deps): bump fork-llm pin to ${{ github.event.workflow_run.head_sha }}"
+          branch: chore/bump-fork-llm-pin
+          delete-branch: true
+          title: "chore(deps): bump fork-llm pin"
+          body: |
+            Bumps the `llm` git dependency pin in `app/Cargo.lock` to
+            [inxm-ai/fork-llm@${{ github.event.workflow_run.head_sha }}](https://github.com/inxm-ai/fork-llm/commit/${{ github.event.workflow_run.head_sha }}),
+            picking up the fork-llm changes that just merged to `main`.
+
+            Opened automatically once fork-llm's `Tests` workflow passed on
+            that commit; review the linked fork-llm commit(s) for behavior
+            changes before merging.
+          base: main
