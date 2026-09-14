@@ -29,6 +29,7 @@
 //!     None, // Default top_k
 //!     None, // No JSON schema
 //!     None, // No tools
+//!     None, // Default service tier
 //! );
 //!
 //! let messages = vec![
