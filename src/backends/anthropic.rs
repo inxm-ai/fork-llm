@@ -66,9 +66,16 @@ pub struct AnthropicConfig {
     pub thinking_budget_tokens: Option<u32>,
     /// Native structured output configuration sent to the Messages API.
     pub output_config: Option<Value>,
-    /// Original constraints enforced locally when the native schema is adapted.
-    /// These requests are buffered before exposing streaming output.
+    /// Original constraints enforced locally when the native schema is adapted,
+    /// or when native output is unavailable for the schema at all. These
+    /// requests are buffered before exposing streaming output.
     pub output_validator: Option<Arc<jsonschema::JSONSchema>>,
+    /// Set when the caller's schema uses a construct Anthropic's native
+    /// `output_config` cannot express (empty/boolean sub-schema, a free-form
+    /// object, `patternProperties`, or `additionalProperties` other than
+    /// `false`). Appended to the system prompt so the model is still told the
+    /// expected shape, with `output_validator` enforcing it locally.
+    pub output_schema_instruction: Option<String>,
 }
 
 /// Client for interacting with Anthropic's API.
@@ -111,6 +118,23 @@ struct ThinkingConfig {
 enum RequestSystemPrompt<'a> {
     String(&'a str),
     Messages(&'a [SystemContent]),
+}
+
+/// Owned counterpart of `RequestSystemPrompt`, used when the system prompt
+/// must be extended (e.g. with a schema instruction) rather than borrowed
+/// as-is from `AnthropicConfig`.
+enum OwnedSystemPrompt {
+    String(String),
+    Messages(Vec<SystemContent>),
+}
+
+impl OwnedSystemPrompt {
+    fn as_request(&self) -> RequestSystemPrompt<'_> {
+        match self {
+            OwnedSystemPrompt::String(s) => RequestSystemPrompt::String(s),
+            OwnedSystemPrompt::Messages(m) => RequestSystemPrompt::Messages(m),
+        }
+    }
 }
 
 /// Request payload for Anthropic's messages API endpoint.
@@ -521,6 +545,19 @@ impl Anthropic {
         }
     }
 
+    /// Builds an owned system prompt with a schema instruction appended, for
+    /// the prompt-based structured output fallback (see `with_structured_output`).
+    fn system_with_schema_instruction(system: &SystemPrompt, instruction: &str) -> OwnedSystemPrompt {
+        match system {
+            SystemPrompt::String(s) => OwnedSystemPrompt::String(format!("{s}\n\n{instruction}")),
+            SystemPrompt::Messages(msgs) => {
+                let mut msgs = msgs.clone();
+                msgs.push(SystemContent::text(instruction.to_string()));
+                OwnedSystemPrompt::Messages(msgs)
+            }
+        }
+    }
+
     /// Creates a new Anthropic client with the specified configuration.
     ///
     /// # Arguments
@@ -619,6 +656,7 @@ impl Anthropic {
                 thinking_budget_tokens,
                 output_config: None,
                 output_validator: None,
+                output_schema_instruction: None,
             }),
             client,
         }
@@ -627,7 +665,14 @@ impl Anthropic {
     /// Configure native JSON outputs. String/array upper bounds unsupported by
     /// Anthropic are moved into descriptions and enforced locally against the
     /// original schema. Adapted outputs are buffered before streaming to callers.
-    /// Other unsupported schemas are still rejected rather than downgraded to text.
+    ///
+    /// Schemas that use a construct Anthropic's native `output_config` cannot
+    /// express at all - an empty or boolean sub-schema, a free-form object
+    /// (no `properties`), `patternProperties`, or `additionalProperties` set
+    /// to anything but `false` - fall back to a prompt-based JSON instruction
+    /// instead of a 400 or a silently narrowed schema (forcing
+    /// `additionalProperties: false` onto a caller-intended free-form object
+    /// would make it accept only `{}`).
     pub fn with_structured_output(
         mut self,
         format: crate::chat::StructuredOutputFormat,
@@ -637,21 +682,36 @@ impl Anthropic {
                 "Anthropic structured output requires an explicit JSON schema".to_string(),
             )
         })?;
-        let wire_schema = structured_output::adapt_schema(&schema);
-        let validator = if wire_schema != schema {
-            Some(Arc::new(jsonschema::JSONSchema::compile(&schema).map_err(
-                |error| {
-                    LLMError::InvalidRequest(format!("Invalid Anthropic output schema: {error}"))
-                },
-            )?))
-        } else {
-            None
-        };
         let config = Arc::make_mut(&mut self.config);
-        config.output_config = Some(serde_json::json!({
-            "format": {"type": "json_schema", "schema": wire_schema}
-        }));
-        config.output_validator = validator;
+        if let Some(reason) = structured_output::unsupported_native_construct(&schema) {
+            log::debug!(
+                "Anthropic native structured output disabled - schema contains {reason}; \
+                 falling back to prompt-based JSON output"
+            );
+            let validator = Arc::new(jsonschema::JSONSchema::compile(&schema).map_err(
+                |error| LLMError::InvalidRequest(format!("Invalid Anthropic output schema: {error}")),
+            )?);
+            config.output_config = None;
+            config.output_validator = Some(validator);
+            config.output_schema_instruction =
+                Some(structured_output::schema_prompt_instruction(&schema));
+        } else {
+            let wire_schema = structured_output::adapt_schema(&schema);
+            let validator = if wire_schema != schema {
+                Some(Arc::new(jsonschema::JSONSchema::compile(&schema).map_err(
+                    |error| {
+                        LLMError::InvalidRequest(format!("Invalid Anthropic output schema: {error}"))
+                    },
+                )?))
+            } else {
+                None
+            };
+            config.output_config = Some(serde_json::json!({
+                "format": {"type": "json_schema", "schema": wire_schema}
+            }));
+            config.output_validator = validator;
+            config.output_schema_instruction = None;
+        }
         Ok(self)
     }
 
@@ -779,7 +839,15 @@ impl ChatProvider for Anthropic {
             None
         };
 
-        let system_prompt = Self::system_to_request(&self.config.system);
+        let owned_system_prompt = self
+            .config
+            .output_schema_instruction
+            .as_deref()
+            .map(|instruction| Self::system_with_schema_instruction(&self.config.system, instruction));
+        let system_prompt = match &owned_system_prompt {
+            Some(owned) => owned.as_request(),
+            None => Self::system_to_request(&self.config.system),
+        };
 
         let req_body = AnthropicCompleteRequest {
             messages: anthropic_messages,
@@ -1546,6 +1614,95 @@ mod tests {
             .build();
         assert!(matches!(result, Err(LLMError::InvalidRequest(message))
             if message.contains("explicit JSON schema")));
+    }
+
+    fn free_form_planner_schema() -> serde_json::Value {
+        // Mirrors the planner schema shape from inxm-ai/app-tgi-core#72: an
+        // open `value: {}` and a free-form `arguments` object.
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "value": {},
+                "arguments": {"type": "object"}
+            },
+            "required": ["value", "arguments"],
+            "additionalProperties": false
+        })
+    }
+
+    #[test]
+    fn schema_anthropic_cannot_express_falls_back_to_prompt_based_output() {
+        let provider = Anthropic::new(
+            "test-key", None, None, None, None, None, None, None, None, None, None, None,
+        )
+        .with_structured_output(crate::chat::StructuredOutputFormat {
+            name: "planner".into(),
+            description: None,
+            strict: Some(true),
+            schema: Some(free_form_planner_schema()),
+        })
+        .unwrap();
+        assert!(provider.config.output_config.is_none());
+        assert!(provider.config.output_validator.is_some());
+        let instruction = provider
+            .config
+            .output_schema_instruction
+            .as_ref()
+            .expect("fallback should carry a schema instruction");
+        assert!(instruction.contains("\"arguments\""));
+    }
+
+    #[tokio::test]
+    async fn fallback_output_is_still_validated_locally_against_the_original_schema() {
+        let provider = Anthropic::new(
+            "test-key", None, None, None, None, None, None, None, None, None, None, None,
+        )
+        .with_structured_output(crate::chat::StructuredOutputFormat {
+            name: "planner".into(),
+            description: None,
+            strict: Some(true),
+            schema: Some(free_form_planner_schema()),
+        })
+        .unwrap();
+        let valid = provider
+            .parse_completion_response(completion_response(
+                r#"{"value": 3, "arguments": {"anything": "goes"}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            valid.text().unwrap(),
+            r#"{"value": 3, "arguments": {"anything": "goes"}}"#
+        );
+        let invalid = provider
+            .parse_completion_response(completion_response(r#"{"value": 3}"#))
+            .await;
+        assert!(matches!(invalid, Err(LLMError::ProviderError(_))));
+    }
+
+    #[test]
+    fn fallback_schema_instruction_is_appended_to_string_system_prompt() {
+        let provider = Anthropic::new(
+            "test-key", None, None, None, None,
+            Some(SystemPrompt::String("You are the planner.".into())),
+            None, None, None, None, None, None,
+        )
+        .with_structured_output(crate::chat::StructuredOutputFormat {
+            name: "planner".into(),
+            description: None,
+            strict: Some(true),
+            schema: Some(free_form_planner_schema()),
+        })
+        .unwrap();
+        let instruction = provider.config.output_schema_instruction.as_deref().unwrap();
+        let owned = Anthropic::system_with_schema_instruction(&provider.config.system, instruction);
+        match owned {
+            OwnedSystemPrompt::String(s) => {
+                assert!(s.starts_with("You are the planner."));
+                assert!(s.contains("JSON Schema"));
+            }
+            OwnedSystemPrompt::Messages(_) => panic!("expected a string system prompt"),
+        }
     }
 
     #[test]

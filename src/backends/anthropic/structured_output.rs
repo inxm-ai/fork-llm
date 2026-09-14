@@ -97,6 +97,90 @@ pub(super) fn adapt_schema(schema: &Value) -> Value {
     Value::Object(adapted)
 }
 
+/// Detects a JSON Schema construct that Anthropic's native `output_config`
+/// cannot express, so the caller can fall back to a prompt-based JSON
+/// instruction instead of either a 400 from the API or a schema silently
+/// narrowed by `adapt_schema` (forcing `additionalProperties: false` onto a
+/// caller-intended free-form object would make it accept only `{}`).
+///
+/// Returns a human-readable description of the first offending construct
+/// found, walking the same schema positions as `adapt_schema`.
+pub(super) fn unsupported_native_construct(schema: &Value) -> Option<String> {
+    match schema {
+        Value::Bool(_) => Some("a boolean sub-schema (`true`/`false`)".to_string()),
+        Value::Object(fields) => {
+            if fields.is_empty() {
+                return Some(
+                    "an empty schema ({}) that accepts any JSON value".to_string(),
+                );
+            }
+            if let Some(additional) = fields.get("additionalProperties") {
+                if additional != &Value::Bool(false) {
+                    return Some(
+                        "'additionalProperties' set to something other than false".to_string(),
+                    );
+                }
+            }
+            if fields.contains_key("patternProperties") {
+                return Some("'patternProperties'".to_string());
+            }
+            let is_object = fields.get("type").and_then(Value::as_str) == Some("object")
+                || fields.contains_key("properties");
+            if is_object && !fields.contains_key("properties") {
+                return Some(
+                    "an object schema without 'properties' (free-form object)".to_string(),
+                );
+            }
+            for key in SCHEMA_MAPS {
+                if let Some(Value::Object(children)) = fields.get(*key) {
+                    if let Some(reason) = children.values().find_map(unsupported_native_construct)
+                    {
+                        return Some(reason);
+                    }
+                }
+            }
+            for key in SCHEMA_ARRAYS {
+                if let Some(Value::Array(children)) = fields.get(*key) {
+                    if let Some(reason) = children.iter().find_map(unsupported_native_construct) {
+                        return Some(reason);
+                    }
+                }
+            }
+            for key in CHILD_SCHEMAS {
+                // additionalProperties is already checked above; `false` is a
+                // valid boolean value there, not an unsupported construct.
+                if *key == "additionalProperties" {
+                    continue;
+                }
+                if let Some(child) = fields.get(*key) {
+                    let reason = match child {
+                        Value::Array(children) => {
+                            children.iter().find_map(unsupported_native_construct)
+                        }
+                        _ => unsupported_native_construct(child),
+                    };
+                    if reason.is_some() {
+                        return reason;
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Renders a schema as a system-prompt instruction for the prompt-based
+/// fallback: models asked to emit JSON matching a schema they were never
+/// shown will otherwise guess the shape.
+pub(super) fn schema_prompt_instruction(schema: &Value) -> String {
+    format!(
+        "Respond with a single JSON object only - no markdown code fences, no prose before or \
+         after it - that satisfies exactly this JSON Schema:\n{}",
+        serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string())
+    )
+}
+
 pub(super) fn validate_output(
     validator: &jsonschema::JSONSchema,
     text: &str,
@@ -205,5 +289,66 @@ mod tests {
         // Non-object schemas are untouched.
         let string_schema = json!({"type": "string"});
         assert!(adapt_schema(&string_schema).get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn flags_constructs_anthropic_cannot_express() {
+        for schema in [
+            json!({}),
+            json!(true),
+            json!({"type": "object"}),
+            json!({"type": "object", "properties": {}, "additionalProperties": true}),
+            json!({"type": "object", "properties": {}, "patternProperties": {"^x-": {"type": "string"}}}),
+        ] {
+            assert!(
+                unsupported_native_construct(&schema).is_some(),
+                "expected {schema} to be flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn flags_the_real_planner_schema_shape() {
+        // app-workflow-manager's base_property_schema declares `value` as an
+        // open `{}` and several fields as free-form objects - see
+        // inxm-ai/app-tgi-core#72.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "plan_properties": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"value": {}},
+                        "required": ["value"],
+                        "additionalProperties": false
+                    }
+                },
+                "arguments": {"type": "object"},
+                "llm_extract_schema": {"type": "object"}
+            },
+            "required": ["plan_properties", "arguments", "llm_extract_schema"],
+            "additionalProperties": false
+        });
+        let reason = unsupported_native_construct(&schema);
+        assert!(reason.is_some());
+    }
+
+    #[test]
+    fn allows_closed_schemas_including_empty_property_maps() {
+        for schema in [
+            json!({"type": "string"}),
+            json!({"type": "object", "properties": {"name": {"type": "string"}}, "additionalProperties": false}),
+            // An explicit empty `properties` map plus `additionalProperties:
+            // false` is a valid closed schema (object must have no fields),
+            // distinct from an object with no `properties` key at all.
+            json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            json!({"type": "array", "items": {"type": "string"}}),
+        ] {
+            assert!(
+                unsupported_native_construct(&schema).is_none(),
+                "did not expect {schema} to be flagged"
+            );
+        }
     }
 }
