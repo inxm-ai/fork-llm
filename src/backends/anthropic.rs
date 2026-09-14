@@ -67,8 +67,9 @@ pub struct AnthropicConfig {
     /// Native structured output configuration sent to the Messages API.
     pub output_config: Option<Value>,
     /// Original constraints enforced locally when the native schema is adapted,
-    /// or when native output is unavailable for the schema at all. These
-    /// requests are buffered before exposing streaming output.
+    /// or when native output is unavailable for the schema at all. Streamed
+    /// requests still stream chunk-by-chunk to the caller; the accumulated
+    /// text is validated against this schema once the response completes.
     pub output_validator: Option<Arc<jsonschema::JSONSchema>>,
     /// Set when the caller's schema uses a construct Anthropic's native
     /// `output_config` cannot express (empty/boolean sub-schema, a free-form
@@ -664,7 +665,9 @@ impl Anthropic {
 
     /// Configure native JSON outputs. String/array upper bounds unsupported by
     /// Anthropic are moved into descriptions and enforced locally against the
-    /// original schema. Adapted outputs are buffered before streaming to callers.
+    /// original schema. Adapted outputs still stream chunk-by-chunk; the
+    /// accumulated text is validated against the original schema once the
+    /// response completes.
     ///
     /// Schemas that use a construct Anthropic's native `output_config` cannot
     /// express at all - an empty or boolean sub-schema, a free-form object
@@ -1043,6 +1046,7 @@ impl ChatProvider for Anthropic {
         tools: Option<&[Tool]>,
     ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
     {
+        crate::chat::ensure_no_audio(messages, AUDIO_UNSUPPORTED)?;
         if self.config.api_key.is_empty() {
             return Err(LLMError::AuthError("Missing Anthropic API key".to_string()));
         }
@@ -1181,17 +1185,24 @@ fn wrap_tool_stream_with_validation(
         inner: std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
         text: String,
         has_tool_calls: bool,
+        done_seen: bool,
+        ended: bool,
     }
 
     let state = State {
         inner,
         text: String::new(),
         has_tool_calls: false,
+        done_seen: false,
+        ended: false,
     };
 
     Box::pin(futures::stream::unfold(state, move |mut state| {
         let validator = validator.clone();
         async move {
+            if state.ended {
+                return None;
+            }
             match state.inner.next().await {
                 Some(Ok(StreamChunk::Text(text))) => {
                     state.text.push_str(&text);
@@ -1202,6 +1213,7 @@ fn wrap_tool_stream_with_validation(
                     Some((Ok(StreamChunk::ToolUseComplete { index, tool_call }), state))
                 }
                 Some(Ok(StreamChunk::Done { stop_reason })) => {
+                    state.done_seen = true;
                     let result = if state.has_tool_calls {
                         Ok(StreamChunk::Done { stop_reason })
                     } else {
@@ -1214,7 +1226,27 @@ fn wrap_tool_stream_with_validation(
                 }
                 Some(Ok(other)) => Some((Ok(other), state)),
                 Some(Err(error)) => Some((Err(error), state)),
-                None => None,
+                None => {
+                    state.ended = true;
+                    if state.done_seen {
+                        None
+                    } else {
+                        // The stream closed without a `Done` event - e.g. a
+                        // dropped connection mid-response - so the
+                        // accumulated text was never validated and may be
+                        // truncated. Surface this as an error instead of
+                        // silently ending a "successful" stream.
+                        Some((
+                            Err(LLMError::ResponseFormatError {
+                                message: "Anthropic stream ended before a Done event; \
+                                          response may be truncated and was not validated"
+                                    .to_string(),
+                                raw_response: state.text.clone(),
+                            }),
+                            state,
+                        ))
+                    }
+                }
             }
         }
     }))
@@ -2310,5 +2342,35 @@ data: {"type": "ping"}
             stream.next().await.unwrap().unwrap(),
             StreamChunk::Done { stop_reason } if stop_reason == "tool_use"
         ));
+    }
+
+    #[tokio::test]
+    async fn tool_stream_validation_errors_when_stream_ends_before_done() {
+        use futures::stream::StreamExt;
+
+        // The underlying SSE stream can reach EOF (dropped connection,
+        // truncated response) without ever emitting a `message_delta`/`Done`
+        // event. The accumulated text was never validated in that case, so
+        // this must surface as an error rather than a quiet successful end.
+        let inner = Box::pin(futures::stream::iter(vec![Ok(StreamChunk::Text(
+            r#"{"steps":["#.to_string(),
+        ))]));
+        let mut stream = wrap_tool_stream_with_validation(inner, draft_validator());
+        stream.next().await; // text chunk, streamed through as-is
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(LLMError::ResponseFormatError { .. }))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_stream_with_tools_rejects_audio_messages() {
+        let provider = bounded_output_provider();
+        let messages = vec![ChatMessage::user().audio(vec![0, 1, 2]).build()];
+        match provider.chat_stream_with_tools(&messages, None).await {
+            Err(LLMError::InvalidRequest(_)) => {}
+            other => panic!("expected InvalidRequest, got {}", other.is_ok()),
+        }
     }
 }
