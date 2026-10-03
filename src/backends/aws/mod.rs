@@ -742,6 +742,13 @@ impl BedrockBackend {
 
     // Helper methods
 
+    /// Whether a request with `extra_tools` carries a tool configuration,
+    /// which Converse requires before it accepts tool blocks in messages.
+    fn sends_tool_config(&self, extra_tools: bool) -> bool {
+        (extra_tools || self.tools.as_ref().is_some_and(|tools| !tools.is_empty()))
+            && !matches!(self.tool_choice, Some(LlmToolChoice::None))
+    }
+
     fn prepare_chat_request(&self, request: ChatRequest) -> Result<PreparedChatRequest> {
         let default_model = self
             .model
@@ -1347,6 +1354,98 @@ impl SpeechToTextProvider for BedrockBackend {
 
 const AUDIO_UNSUPPORTED: &str = "Audio messages are not supported by AWS Bedrock chat";
 
+/// Converse-API messages for `messages`. With `native_tools`, earlier tool
+/// calls and results become `toolUse`/`toolResult` blocks instead of text:
+/// a model that only ever sees its past calls as text starts writing calls
+/// as text. Consecutive messages of one role are then merged, because
+/// Converse expects alternating roles and every `toolResult` of a turn in
+/// the single user message after it. Without tools the request carries no
+/// toolConfig, which Converse requires for tool blocks, so the text form
+/// stays.
+fn to_bedrock_messages(messages: &[LlmChatMessage], native_tools: bool) -> Vec<ChatMessage> {
+    let mut merged: Vec<(&'static str, Vec<ContentPart>)> = Vec::new();
+    for m in messages {
+        let role = match m.role {
+            crate::chat::ChatRole::User => "user",
+            crate::chat::ChatRole::Assistant => "assistant",
+        };
+        let text = || ContentPart::Text {
+            text: m.content.clone(),
+        };
+        let parts = match &m.message_type {
+            crate::chat::MessageType::Image((mime, bytes)) => vec![
+                text(),
+                ContentPart::Image {
+                    source: bytes.clone(),
+                    media_type: mime.mime_type().to_string(),
+                },
+            ],
+            crate::chat::MessageType::ToolUse(calls) if native_tools => {
+                let mut parts = Vec::new();
+                if !m.content.trim().is_empty() {
+                    parts.push(text());
+                }
+                parts.extend(calls.iter().map(|call| ContentPart::ToolUse {
+                    id: call.id.clone(),
+                    name: call.function.name.clone(),
+                    input: tool_input(&call.function.arguments),
+                }));
+                parts
+            }
+            crate::chat::MessageType::ToolResult(results) if native_tools => results
+                .iter()
+                .map(|result| ContentPart::ToolResult {
+                    tool_use_id: result.id.clone(),
+                    content: if result.function.arguments.trim().is_empty() {
+                        "(no output)".to_string()
+                    } else {
+                        result.function.arguments.clone()
+                    },
+                    is_error: false,
+                })
+                .collect(),
+            _ => vec![text()],
+        };
+        match merged.last_mut() {
+            Some((last_role, last_parts)) if native_tools && *last_role == role => {
+                last_parts.extend(parts)
+            }
+            _ => merged.push((role, parts)),
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(role, mut parts)| {
+            // Text precedes the calls of an assistant turn; results come
+            // first in the user turn that answers them.
+            let rank = |part: &ContentPart| match (role, part) {
+                ("assistant", ContentPart::ToolUse { .. }) => 1,
+                ("user", ContentPart::ToolResult { .. }) => 0,
+                ("user", _) => 1,
+                _ => 0,
+            };
+            parts.sort_by_key(rank);
+            let content = match parts.as_slice() {
+                [ContentPart::Text { text }] => MessageContent::Text(text.clone()),
+                _ => MessageContent::MultiModal(parts),
+            };
+            ChatMessage {
+                role: role.to_string(),
+                content,
+            }
+        })
+        .collect()
+}
+
+/// Converse requires a tool input to be a JSON object; a call whose
+/// arguments were not one (and was answered with an error) keeps `{}`.
+fn tool_input(arguments: &str) -> Value {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}))
+}
+
 #[async_trait]
 impl ChatProvider for BedrockBackend {
     async fn chat_with_tools(
@@ -1355,36 +1454,10 @@ impl ChatProvider for BedrockBackend {
         tools: Option<&[LlmTool]>,
     ) -> std::result::Result<Box<dyn crate::chat::ChatResponse>, crate::error::LLMError> {
         crate::chat::ensure_no_audio(messages, AUDIO_UNSUPPORTED)?;
-        let aws_messages: Vec<ChatMessage> = messages
-            .iter()
-            .map(|m| {
-                let role = match m.role {
-                    crate::chat::ChatRole::User => "user",
-                    crate::chat::ChatRole::Assistant => "assistant",
-                };
-
-                let content = match &m.message_type {
-                    crate::chat::MessageType::Text => MessageContent::Text(m.content.clone()),
-                    crate::chat::MessageType::Image((mime, bytes)) => {
-                        MessageContent::MultiModal(vec![
-                            ContentPart::Text {
-                                text: m.content.clone(),
-                            },
-                            ContentPart::Image {
-                                source: bytes.clone(),
-                                media_type: mime.mime_type().to_string(),
-                            },
-                        ])
-                    }
-                    _ => MessageContent::Text(m.content.clone()),
-                };
-
-                ChatMessage {
-                    role: role.to_string(),
-                    content,
-                }
-            })
-            .collect();
+        let aws_messages = to_bedrock_messages(
+            messages,
+            self.sends_tool_config(tools.is_some_and(|tools| !tools.is_empty())),
+        );
 
         let mut request = ChatRequest::new(aws_messages);
 
@@ -1456,36 +1529,7 @@ impl ChatProvider for BedrockBackend {
         >,
         crate::error::LLMError,
     > {
-        let aws_messages: Vec<ChatMessage> = messages
-            .iter()
-            .map(|m| {
-                let role = match m.role {
-                    crate::chat::ChatRole::User => "user",
-                    crate::chat::ChatRole::Assistant => "assistant",
-                };
-
-                let content = match &m.message_type {
-                    crate::chat::MessageType::Text => MessageContent::Text(m.content.clone()),
-                    crate::chat::MessageType::Image((mime, bytes)) => {
-                        MessageContent::MultiModal(vec![
-                            ContentPart::Text {
-                                text: m.content.clone(),
-                            },
-                            ContentPart::Image {
-                                source: bytes.clone(),
-                                media_type: mime.mime_type().to_string(),
-                            },
-                        ])
-                    }
-                    _ => MessageContent::Text(m.content.clone()),
-                };
-
-                ChatMessage {
-                    role: role.to_string(),
-                    content,
-                }
-            })
-            .collect();
+        let aws_messages = to_bedrock_messages(messages, self.sends_tool_config(false));
 
         let request = ChatRequest::new(aws_messages);
         let stream = BedrockBackend::chat_stream_with_tools(self, request)
@@ -1534,36 +1578,10 @@ impl ChatProvider for BedrockBackend {
         >,
         crate::error::LLMError,
     > {
-        let aws_messages: Vec<ChatMessage> = messages
-            .iter()
-            .map(|m| {
-                let role = match m.role {
-                    crate::chat::ChatRole::User => "user",
-                    crate::chat::ChatRole::Assistant => "assistant",
-                };
-
-                let content = match &m.message_type {
-                    crate::chat::MessageType::Text => MessageContent::Text(m.content.clone()),
-                    crate::chat::MessageType::Image((mime, bytes)) => {
-                        MessageContent::MultiModal(vec![
-                            ContentPart::Text {
-                                text: m.content.clone(),
-                            },
-                            ContentPart::Image {
-                                source: bytes.clone(),
-                                media_type: mime.mime_type().to_string(),
-                            },
-                        ])
-                    }
-                    _ => MessageContent::Text(m.content.clone()),
-                };
-
-                ChatMessage {
-                    role: role.to_string(),
-                    content,
-                }
-            })
-            .collect();
+        let aws_messages = to_bedrock_messages(
+            messages,
+            self.sends_tool_config(tools.is_some_and(|tools| !tools.is_empty())),
+        );
 
         let mut request = ChatRequest::new(aws_messages);
 
@@ -1637,6 +1655,113 @@ impl LLMProvider for BedrockBackend {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    /// The history app-tgi-core sends for one tool turn: the assistant
+    /// turn split into its calls and its text, then one result message
+    /// per call. Found live against qa: sent as text, the model started
+    /// writing `tool_calls: [...]` instead of calling tools.
+    fn tool_turn() -> Vec<LlmChatMessage> {
+        vec![
+            LlmChatMessage::user().content("Connect Cloudflare").build(),
+            LlmChatMessage::assistant()
+                .tool_use(vec![
+                    call("t1", "probe_mcp_url", r#"{"mcp_url":"https://x/mcp"}"#),
+                    call("t2", "list_mcps", "{}"),
+                ])
+                .build(),
+            LlmChatMessage::assistant().content("Checking.").build(),
+            LlmChatMessage::user()
+                .tool_result(vec![call("t1", "probe_mcp_url", r#"{"verdict":"open"}"#)])
+                .build(),
+            LlmChatMessage::user()
+                .tool_result(vec![call("t2", "list_mcps", "")])
+                .build(),
+            LlmChatMessage::user().content("Thanks").build(),
+        ]
+    }
+
+    #[test]
+    fn tool_history_is_sent_as_tool_blocks_in_alternating_turns() {
+        let messages = to_bedrock_messages(&tool_turn(), true);
+        let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+        let MessageContent::MultiModal(assistant) = &messages[1].content else {
+            panic!("assistant turn must carry tool blocks");
+        };
+        assert!(matches!(&assistant[0], ContentPart::Text { text } if text == "Checking."));
+        assert!(matches!(
+            &assistant[1],
+            ContentPart::ToolUse { id, name, input }
+                if id == "t1" && name == "probe_mcp_url" && input["mcp_url"] == "https://x/mcp"
+        ));
+        assert!(matches!(&assistant[2], ContentPart::ToolUse { id, .. } if id == "t2"));
+        let MessageContent::MultiModal(user) = &messages[2].content else {
+            panic!("results and the next text share one user turn");
+        };
+        assert!(
+            matches!(&user[0], ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == "t1")
+        );
+        assert!(matches!(
+            &user[1],
+            ContentPart::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "t2" && content == "(no output)"
+        ));
+        assert!(matches!(&user[2], ContentPart::Text { text } if text == "Thanks"));
+        for message in &messages {
+            BedrockBackend::new(
+                "us-east-1".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .convert_message(message)
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn without_tools_the_history_stays_text() {
+        let messages = to_bedrock_messages(&tool_turn(), false);
+        assert_eq!(messages.len(), tool_turn().len());
+        assert!(messages
+            .iter()
+            .all(|m| matches!(m.content, MessageContent::Text(_))));
+    }
+
+    #[test]
+    fn a_call_whose_arguments_were_not_an_object_is_replayed_as_empty_input() {
+        let history = vec![
+            LlmChatMessage::user().content("go").build(),
+            LlmChatMessage::assistant()
+                .tool_use(vec![call("t1", "a_b", r#"{}{"x":1}"#)])
+                .build(),
+        ];
+        let messages = to_bedrock_messages(&history, true);
+        let MessageContent::MultiModal(parts) = &messages[1].content else {
+            panic!("expected tool blocks");
+        };
+        assert!(matches!(&parts[0], ContentPart::ToolUse { input, .. } if input == &json!({})));
+    }
 
     #[tokio::test]
     async fn test_backend_creation() {
