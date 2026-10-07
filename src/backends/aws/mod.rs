@@ -493,6 +493,118 @@ impl BedrockBackend {
         })
     }
 
+    /// Embed 1..=96 texts in one Bedrock call. Only Cohere embed models accept batches.
+    pub async fn embed_batch_request(
+        &self,
+        request: EmbeddingBatchRequest,
+    ) -> Result<EmbeddingBatchResponse> {
+        let model_id = request
+            .model
+            .clone()
+            .or(self.model.clone())
+            .unwrap_or(BedrockModel::Direct(DirectModel::TitanEmbedV2));
+
+        if !self.model_supports(&model_id, ModelCapability::Embeddings) {
+            return Err(BedrockError::UnsupportedOperation(format!(
+                "Model {} does not support embeddings",
+                model_id.model_id()
+            )));
+        }
+        if !matches!(
+            model_id,
+            BedrockModel::Direct(DirectModel::CohereEmbedV3)
+                | BedrockModel::Direct(DirectModel::CohereEmbedMultilingualV3)
+                | BedrockModel::CrossRegion {
+                    model: models::CrossRegionModel::CohereEmbedV4,
+                    ..
+                }
+        ) {
+            return Err(BedrockError::UnsupportedOperation(format!(
+                "Model {} does not support batched embeddings",
+                model_id.model_id()
+            )));
+        }
+        let expected = request.inputs.len();
+        let input_body = embed_batch_body(request.inputs, request.input_type)?;
+
+        let client = self.get_client().await?;
+        let response = client
+            .invoke_model()
+            .model_id(model_id.model_id())
+            .body(Blob::new(serde_json::to_vec(&input_body)?))
+            .send()
+            .await
+            .map_err(|e| BedrockError::ApiError(format!("{:?}", e)))?;
+
+        let body: Value = serde_json::from_slice(response.body().as_ref())?;
+        let embeddings: Vec<Vec<f64>> = body
+            .get("embeddings")
+            .and_then(|e| e.get("float"))
+            .and_then(|e| e.as_array())
+            .ok_or_else(|| BedrockError::InvalidResponse("No embeddings in response".to_string()))?
+            .iter()
+            .map(|embedding| {
+                embedding
+                    .as_array()
+                    .map(|values| values.iter().filter_map(|v| v.as_f64()).collect())
+                    .ok_or_else(|| {
+                        BedrockError::InvalidResponse("Embedding is not an array".to_string())
+                    })
+            })
+            .collect::<Result<_>>()?;
+        if embeddings.len() != expected {
+            return Err(BedrockError::InvalidResponse(format!(
+                "Expected {} embeddings, got {}",
+                expected,
+                embeddings.len()
+            )));
+        }
+
+        let dimensions = embeddings.first().map_or(0, Vec::len);
+        Ok(EmbeddingBatchResponse {
+            embeddings,
+            model: model_id,
+            dimensions,
+        })
+    }
+
+    /// Rank 1..=1000 documents against a query with a rerank model (Cohere Rerank 3.5).
+    pub async fn rerank_request(&self, request: RerankRequest) -> Result<RerankResponse> {
+        let model_id = request
+            .model
+            .clone()
+            .unwrap_or(BedrockModel::Direct(DirectModel::CohereRerankV35));
+
+        if !self.model_supports(&model_id, ModelCapability::Rerank) {
+            return Err(BedrockError::UnsupportedOperation(format!(
+                "Model {} does not support rerank",
+                model_id.model_id()
+            )));
+        }
+        let input_body = rerank_body(request.query, request.documents, request.top_n)?;
+
+        let client = self.get_client().await?;
+        let response = client
+            .invoke_model()
+            .model_id(model_id.model_id())
+            .body(Blob::new(serde_json::to_vec(&input_body)?))
+            .send()
+            .await
+            .map_err(|e| BedrockError::ApiError(format!("{:?}", e)))?;
+
+        let body: Value = serde_json::from_slice(response.body().as_ref())?;
+        let results = body
+            .get("results")
+            .cloned()
+            .ok_or_else(|| BedrockError::InvalidResponse("No results in response".to_string()))?;
+        let results: Vec<RerankResult> = serde_json::from_value(results)?;
+
+        Ok(RerankResponse {
+            results,
+            model: model_id,
+        })
+    }
+
     /// Stream chat responses
     pub async fn chat_stream(
         &self,
@@ -1634,6 +1746,36 @@ impl EmbeddingProvider for BedrockBackend {
 
 impl LLMProvider for BedrockBackend {}
 
+/// Bedrock body for a Cohere embed call over `inputs` (1..=96 texts).
+fn embed_batch_body(inputs: Vec<String>, input_type: Option<String>) -> Result<Value> {
+    if inputs.is_empty() || inputs.len() > 96 {
+        return Err(BedrockError::InvalidRequest(
+            "cohere embed takes 1..=96 texts".to_string(),
+        ));
+    }
+    Ok(json!({
+        "texts": inputs,
+        "input_type": input_type.unwrap_or_else(|| "search_document".to_string()),
+        "embedding_types": ["float"],
+    }))
+}
+
+/// Bedrock body for a Cohere rerank call over `documents` (1..=1000).
+fn rerank_body(query: String, documents: Vec<String>, top_n: Option<usize>) -> Result<Value> {
+    if documents.is_empty() || documents.len() > 1000 {
+        return Err(BedrockError::InvalidRequest(
+            "cohere rerank takes 1..=1000 documents".to_string(),
+        ));
+    }
+    let top_n = top_n.unwrap_or(documents.len());
+    Ok(json!({
+        "query": query,
+        "documents": documents,
+        "top_n": top_n,
+        "api_version": 2,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1931,5 +2073,36 @@ streaming = true
         // Only the real tool, no json_schema_tool pollution
         assert_eq!(tools.len(), 1);
         assert!(matches!(tools[0], Tool::ToolSpec(ref spec) if spec.name() == "get_weather"));
+    }
+
+    #[test]
+    fn test_embed_batch_body_sends_all_texts() {
+        let body = embed_batch_body(vec!["a".into(), "b".into()], None).unwrap();
+        assert_eq!(
+            body,
+            json!({"texts": ["a", "b"], "input_type": "search_document", "embedding_types": ["float"]})
+        );
+    }
+
+    #[test]
+    fn test_embed_batch_body_rejects_empty_and_over_96() {
+        assert!(embed_batch_body(vec![], None).is_err());
+        assert!(embed_batch_body(vec!["x".into(); 97], None).is_err());
+        assert!(embed_batch_body(vec!["x".into(); 96], None).is_ok());
+    }
+
+    #[test]
+    fn test_rerank_body_defaults_top_n_to_document_count() {
+        let body = rerank_body("q".into(), vec!["a".into(), "b".into()], None).unwrap();
+        assert_eq!(
+            body,
+            json!({"query": "q", "documents": ["a", "b"], "top_n": 2, "api_version": 2})
+        );
+    }
+
+    #[test]
+    fn test_rerank_body_rejects_empty_and_over_1000() {
+        assert!(rerank_body("q".into(), vec![], None).is_err());
+        assert!(rerank_body("q".into(), vec!["x".into(); 1001], None).is_err());
     }
 }

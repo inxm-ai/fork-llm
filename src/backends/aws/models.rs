@@ -102,6 +102,9 @@ pub enum DirectModel {
     #[serde(rename = "cohere.embed-multilingual-v3")]
     CohereEmbedMultilingualV3,
 
+    #[serde(rename = "cohere.rerank-v3-5:0")]
+    CohereRerankV35,
+
     // Mistral models
     #[serde(rename = "mistral.mistral-large-2407-v1:0")]
     MistralLarge,
@@ -349,6 +352,7 @@ impl DirectModel {
             Self::CohereCommandR => "cohere.command-r-v1:0",
             Self::CohereEmbedV3 => "cohere.embed-english-v3",
             Self::CohereEmbedMultilingualV3 => "cohere.embed-multilingual-v3",
+            Self::CohereRerankV35 => "cohere.rerank-v3-5:0",
             Self::MistralLarge => "mistral.mistral-large-2407-v1:0",
             Self::MistralSmall => "mistral.mistral-small-2402-v1:0",
         }
@@ -380,6 +384,7 @@ impl DirectModel {
             "cohere.command-r-v1:0" => Some(Self::CohereCommandR),
             "cohere.embed-english-v3" => Some(Self::CohereEmbedV3),
             "cohere.embed-multilingual-v3" => Some(Self::CohereEmbedMultilingualV3),
+            "cohere.rerank-v3-5:0" => Some(Self::CohereRerankV35),
             "mistral.mistral-large-2407-v1:0" => Some(Self::MistralLarge),
             "mistral.mistral-small-2402-v1:0" => Some(Self::MistralSmall),
             _ => None,
@@ -463,6 +468,7 @@ impl BedrockModel {
             ModelCapability::Vision => self.supports_vision_impl(),
             ModelCapability::ToolUse => self.supports_tools_impl(),
             ModelCapability::Streaming => self.is_text_model() || self.is_chat_model(),
+            ModelCapability::Rerank => self.is_rerank_model(),
             ModelCapability::NativeStructuredOutput => {
                 self.supports_native_structured_output_impl()
             }
@@ -470,7 +476,14 @@ impl BedrockModel {
     }
 
     fn is_text_model(&self) -> bool {
-        !self.is_embedding_model()
+        !self.is_embedding_model() && !self.is_rerank_model()
+    }
+
+    fn is_rerank_model(&self) -> bool {
+        matches!(
+            self.inner_model(),
+            InnerModel::Direct(DirectModel::CohereRerankV35)
+        )
     }
 
     fn is_chat_model(&self) -> bool {
@@ -542,6 +555,7 @@ impl DirectModel {
                 | Self::TitanEmbedV1
                 | Self::CohereEmbedV3
                 | Self::CohereEmbedMultilingualV3
+                | Self::CohereRerankV35
         )
     }
 
@@ -739,6 +753,9 @@ pub enum ModelCapability {
     /// Models with this capability receive JSON directly without the synthetic
     /// json_schema_tool workaround needed by Claude and other models.
     NativeStructuredOutput,
+
+    /// Document reranking against a query (cross-encoder)
+    Rerank,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -833,6 +850,8 @@ pub struct ModelCapabilityOverride {
     pub streaming: Option<bool>,
     #[serde(default)]
     pub native_structured_output: Option<bool>,
+    #[serde(default)]
+    pub rerank: Option<bool>,
 }
 
 impl ModelCapabilityOverride {
@@ -845,6 +864,7 @@ impl ModelCapabilityOverride {
             ModelCapability::ToolUse => self.tool_use,
             ModelCapability::Streaming => self.streaming,
             ModelCapability::NativeStructuredOutput => self.native_structured_output,
+            ModelCapability::Rerank => self.rerank,
         }
     }
 }
@@ -1136,5 +1156,28 @@ mod tests {
 
         let llama = BedrockModel::Direct(DirectModel::Llama32_3B);
         assert_eq!(llama.max_output_tokens(), 2048);
+    }
+
+    #[test]
+    fn test_rerank_model_round_trip() {
+        let model = BedrockModel::from_id("cohere.rerank-v3-5:0");
+        assert!(matches!(
+            model,
+            BedrockModel::Direct(DirectModel::CohereRerankV35)
+        ));
+        assert_eq!(model.model_id(), "cohere.rerank-v3-5:0");
+    }
+
+    #[test]
+    fn test_rerank_capability_only_on_rerank_model() {
+        let rerank = BedrockModel::Direct(DirectModel::CohereRerankV35);
+        assert!(rerank.supports(ModelCapability::Rerank));
+        assert!(!rerank.supports(ModelCapability::Chat));
+        assert!(!rerank.supports(ModelCapability::Embeddings));
+
+        assert!(
+            !BedrockModel::eu(CrossRegionModel::CohereEmbedV4).supports(ModelCapability::Rerank)
+        );
+        assert!(!BedrockModel::Direct(DirectModel::ClaudeSonnet4).supports(ModelCapability::Rerank));
     }
 }
