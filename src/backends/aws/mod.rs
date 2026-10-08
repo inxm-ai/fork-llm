@@ -1065,6 +1065,10 @@ impl BedrockBackend {
             );
         }
 
+        if tool_config.is_none() && self.model_supports(&model_id, ModelCapability::ToolUse) {
+            tool_config = placeholder_tool_config(&messages)?;
+        }
+
         // Inference config
         let inference_config = aws_sdk_bedrockruntime::types::InferenceConfiguration::builder()
             .set_max_tokens(request.max_tokens.or(self.max_tokens).map(|t| t as i32))
@@ -1467,36 +1471,7 @@ impl ChatProvider for BedrockBackend {
         tools: Option<&[LlmTool]>,
     ) -> std::result::Result<Box<dyn crate::chat::ChatResponse>, crate::error::LLMError> {
         crate::chat::ensure_no_audio(messages, AUDIO_UNSUPPORTED)?;
-        let aws_messages: Vec<ChatMessage> = messages
-            .iter()
-            .map(|m| {
-                let role = match m.role {
-                    crate::chat::ChatRole::User => "user",
-                    crate::chat::ChatRole::Assistant => "assistant",
-                };
-
-                let content = match &m.message_type {
-                    crate::chat::MessageType::Text => MessageContent::Text(m.content.clone()),
-                    crate::chat::MessageType::Image((mime, bytes)) => {
-                        MessageContent::MultiModal(vec![
-                            ContentPart::Text {
-                                text: m.content.clone(),
-                            },
-                            ContentPart::Image {
-                                source: bytes.clone(),
-                                media_type: mime.mime_type().to_string(),
-                            },
-                        ])
-                    }
-                    _ => MessageContent::Text(m.content.clone()),
-                };
-
-                ChatMessage {
-                    role: role.to_string(),
-                    content,
-                }
-            })
-            .collect();
+        let aws_messages = history_to_messages(messages);
 
         let mut request = ChatRequest::new(aws_messages);
 
@@ -1528,19 +1503,7 @@ impl ChatProvider for BedrockBackend {
         Pin<Box<dyn Stream<Item = std::result::Result<String, crate::error::LLMError>> + Send>>,
         crate::error::LLMError,
     > {
-        let aws_messages: Vec<ChatMessage> = messages
-            .iter()
-            .map(|m| {
-                let role = match m.role {
-                    crate::chat::ChatRole::User => "user",
-                    crate::chat::ChatRole::Assistant => "assistant",
-                };
-                ChatMessage {
-                    role: role.to_string(),
-                    content: MessageContent::Text(m.content.clone()),
-                }
-            })
-            .collect();
+        let aws_messages = history_to_messages(messages);
 
         let request = ChatRequest::new(aws_messages);
         let stream = self
@@ -1568,36 +1531,7 @@ impl ChatProvider for BedrockBackend {
         >,
         crate::error::LLMError,
     > {
-        let aws_messages: Vec<ChatMessage> = messages
-            .iter()
-            .map(|m| {
-                let role = match m.role {
-                    crate::chat::ChatRole::User => "user",
-                    crate::chat::ChatRole::Assistant => "assistant",
-                };
-
-                let content = match &m.message_type {
-                    crate::chat::MessageType::Text => MessageContent::Text(m.content.clone()),
-                    crate::chat::MessageType::Image((mime, bytes)) => {
-                        MessageContent::MultiModal(vec![
-                            ContentPart::Text {
-                                text: m.content.clone(),
-                            },
-                            ContentPart::Image {
-                                source: bytes.clone(),
-                                media_type: mime.mime_type().to_string(),
-                            },
-                        ])
-                    }
-                    _ => MessageContent::Text(m.content.clone()),
-                };
-
-                ChatMessage {
-                    role: role.to_string(),
-                    content,
-                }
-            })
-            .collect();
+        let aws_messages = history_to_messages(messages);
 
         let request = ChatRequest::new(aws_messages);
         let stream = BedrockBackend::chat_stream_with_tools(self, request)
@@ -1646,36 +1580,7 @@ impl ChatProvider for BedrockBackend {
         >,
         crate::error::LLMError,
     > {
-        let aws_messages: Vec<ChatMessage> = messages
-            .iter()
-            .map(|m| {
-                let role = match m.role {
-                    crate::chat::ChatRole::User => "user",
-                    crate::chat::ChatRole::Assistant => "assistant",
-                };
-
-                let content = match &m.message_type {
-                    crate::chat::MessageType::Text => MessageContent::Text(m.content.clone()),
-                    crate::chat::MessageType::Image((mime, bytes)) => {
-                        MessageContent::MultiModal(vec![
-                            ContentPart::Text {
-                                text: m.content.clone(),
-                            },
-                            ContentPart::Image {
-                                source: bytes.clone(),
-                                media_type: mime.mime_type().to_string(),
-                            },
-                        ])
-                    }
-                    _ => MessageContent::Text(m.content.clone()),
-                };
-
-                ChatMessage {
-                    role: role.to_string(),
-                    content,
-                }
-            })
-            .collect();
+        let aws_messages = history_to_messages(messages);
 
         let mut request = ChatRequest::new(aws_messages);
 
@@ -1758,6 +1663,147 @@ fn embed_batch_body(inputs: Vec<String>, input_type: Option<String>) -> Result<V
         "input_type": input_type.unwrap_or_else(|| "search_document".to_string()),
         "embedding_types": ["float"],
     }))
+}
+
+/// Converts chat history to Converse messages with native `toolUse`/`toolResult` parts.
+/// Messages are merged with a same-role neighbour only when tool parts are involved, since
+/// Converse needs alternating roles and all results of one turn in a single user message.
+fn history_to_messages(messages: &[LlmChatMessage]) -> Vec<ChatMessage> {
+    let has_tool_part = |parts: &[ContentPart]| {
+        parts.iter().any(|p| {
+            matches!(
+                p,
+                ContentPart::ToolUse { .. } | ContentPart::ToolResult { .. }
+            )
+        })
+    };
+
+    let mut merged: Vec<(&'static str, Vec<ContentPart>)> = Vec::new();
+    for m in messages {
+        let role = match m.role {
+            crate::chat::ChatRole::User => "user",
+            crate::chat::ChatRole::Assistant => "assistant",
+        };
+        let parts = history_parts(m);
+        if parts.is_empty() {
+            continue;
+        }
+        match merged.last_mut() {
+            Some((last_role, last_parts))
+                if *last_role == role && (has_tool_part(last_parts) || has_tool_part(&parts)) =>
+            {
+                last_parts.extend(parts)
+            }
+            _ => merged.push((role, parts)),
+        }
+    }
+
+    merged
+        .into_iter()
+        .map(|(role, mut parts)| {
+            // Results lead a user message; tool calls trail assistant text.
+            parts.sort_by_key(|p| match p {
+                ContentPart::ToolResult { .. } => 0,
+                ContentPart::ToolUse { .. } => 2,
+                _ => 1,
+            });
+            let content = match parts.as_slice() {
+                [ContentPart::Text { text }] => MessageContent::Text(text.clone()),
+                _ => MessageContent::MultiModal(parts),
+            };
+            ChatMessage {
+                role: role.to_string(),
+                content,
+            }
+        })
+        .collect()
+}
+
+fn history_parts(m: &LlmChatMessage) -> Vec<ContentPart> {
+    let text = || ContentPart::Text {
+        text: m.content.clone(),
+    };
+    match &m.message_type {
+        crate::chat::MessageType::Image((mime, bytes)) => vec![
+            text(),
+            ContentPart::Image {
+                source: bytes.clone(),
+                media_type: mime.mime_type().to_string(),
+            },
+        ],
+        crate::chat::MessageType::ToolUse(calls) => {
+            let leading_text = (!m.content.trim().is_empty()).then(text);
+            leading_text
+                .into_iter()
+                .chain(calls.iter().map(|call| ContentPart::ToolUse {
+                    id: call.id.clone(),
+                    name: call.function.name.clone(),
+                    input: tool_input(&call.function.arguments),
+                }))
+                .collect()
+        }
+        crate::chat::MessageType::ToolResult(results) => results
+            .iter()
+            .map(|result| ContentPart::ToolResult {
+                tool_use_id: result.id.clone(),
+                // Converse rejects blank text blocks.
+                content: if result.function.arguments.trim().is_empty() {
+                    "[empty]".to_string()
+                } else {
+                    result.function.arguments.clone()
+                },
+                is_error: false,
+            })
+            .collect(),
+        _ => vec![text()],
+    }
+}
+
+/// Tool input must be a JSON object; unparsable or non-object arguments are kept
+/// verbatim under `raw_arguments` rather than dropping the call.
+fn tool_input(arguments: &str) -> Value {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(value @ Value::Object(_)) => value,
+        _ if arguments.trim().is_empty() => json!({}),
+        _ => json!({ "raw_arguments": arguments }),
+    }
+}
+
+const PLACEHOLDER_TOOL_NAME: &str = "internal_placeholder_tool";
+
+/// Converse rejects toolUse/toolResult blocks without a toolConfig. When history has them but
+/// no real tools are offered (none given, or tool choice is none), declare an uncallable
+/// placeholder so the request is valid and the model cannot call anything real.
+fn placeholder_tool_config(messages: &[Message]) -> Result<Option<ToolConfiguration>> {
+    let has_tool_blocks = messages.iter().flat_map(|m| m.content()).any(|block| {
+        matches!(
+            block,
+            ContentBlock::ToolUse(_) | ContentBlock::ToolResult(_)
+        )
+    });
+    if !has_tool_blocks {
+        return Ok(None);
+    }
+
+    let invalid = |e: &dyn std::fmt::Debug| {
+        BedrockError::InvalidRequest(format!("Failed to build placeholder tool: {:?}", e))
+    };
+    let spec = aws_sdk_bedrockruntime::types::ToolSpecification::builder()
+        .name(PLACEHOLDER_TOOL_NAME)
+        .description("Unavailable. Never call this tool.")
+        .input_schema(ToolInputSchema::Json(BedrockBackend::value_to_document(
+            &json!({"type": "object", "properties": {}}),
+        )))
+        .build()
+        .map_err(|e| invalid(&e))?;
+    ToolConfiguration::builder()
+        .tools(Tool::ToolSpec(spec))
+        .tool_choice(aws_sdk_bedrockruntime::types::ToolChoice::Auto(
+            aws_sdk_bedrockruntime::types::AutoToolChoice::builder().build(),
+        ))
+        .build()
+        .map(Some)
+        .map_err(|e| invalid(&e))
 }
 
 /// Bedrock body for a Cohere rerank call over `documents` (1..=1000).
@@ -1954,6 +2000,234 @@ streaming = true
         let tool_call = state.to_tool_call();
 
         assert_eq!(tool_call.function.arguments, "{}");
+    }
+
+    fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    fn parts(message: &ChatMessage) -> &[ContentPart] {
+        match &message.content {
+            MessageContent::MultiModal(parts) => parts,
+            MessageContent::Text(_) => panic!("expected multimodal content"),
+        }
+    }
+
+    #[test]
+    fn test_history_sends_tool_call_and_result_natively() {
+        let search = call("call_1", "search_tools", r#"{"query":"pull requests"}"#);
+        let result = call(
+            "call_1",
+            "search_tools",
+            r#"{"added_tools":["list_pull_requests"]}"#,
+        );
+        let history = vec![
+            LlmChatMessage::user()
+                .content("Find open pull requests")
+                .build(),
+            LlmChatMessage::assistant().tool_use(vec![search]).build(),
+            LlmChatMessage::user().tool_result(vec![result]).build(),
+        ];
+
+        let messages = history_to_messages(&history);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].role, "assistant");
+        match parts(&messages[1]) {
+            [ContentPart::ToolUse { id, name, input }] => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "search_tools");
+                assert_eq!(input, &json!({"query": "pull requests"}));
+            }
+            other => panic!("unexpected parts: {other:?}"),
+        }
+        assert_eq!(messages[2].role, "user");
+        match parts(&messages[2]) {
+            [ContentPart::ToolResult {
+                tool_use_id,
+                content,
+                is_error: false,
+            }] => {
+                assert_eq!(tool_use_id, "call_1");
+                assert!(content.contains("list_pull_requests"));
+            }
+            other => panic!("unexpected parts: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_history_merges_parallel_results_and_orders_text_before_calls() {
+        let history = vec![
+            LlmChatMessage::user().content("go").build(),
+            LlmChatMessage::assistant()
+                .tool_use(vec![call("a", "one", "{}"), call("b", "two", "{}")])
+                .build(),
+            LlmChatMessage::assistant()
+                .content("Checking both.")
+                .build(),
+            LlmChatMessage::user()
+                .tool_result(vec![call("a", "one", "ok")])
+                .build(),
+            LlmChatMessage::user()
+                .tool_result(vec![call("b", "two", "")])
+                .build(),
+        ];
+
+        let messages = history_to_messages(&history);
+
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            parts(&messages[1]),
+            [
+                ContentPart::Text { .. },
+                ContentPart::ToolUse { .. },
+                ContentPart::ToolUse { .. }
+            ]
+        ));
+        match parts(&messages[2]) {
+            [ContentPart::ToolResult {
+                tool_use_id: first, ..
+            }, ContentPart::ToolResult {
+                tool_use_id: second,
+                content,
+                ..
+            }] => {
+                assert_eq!((first.as_str(), second.as_str()), ("a", "b"));
+                assert_eq!(content, "[empty]");
+            }
+            other => panic!("unexpected parts: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_history_leaves_plain_text_messages_unmerged() {
+        let history = vec![
+            LlmChatMessage::user().content("a").build(),
+            LlmChatMessage::user().content("b").build(),
+        ];
+
+        assert_eq!(history_to_messages(&history).len(), 2);
+    }
+
+    #[test]
+    fn test_tool_input_keeps_unparsable_arguments() {
+        assert_eq!(tool_input(r#"{"a":1}"#), json!({"a": 1}));
+        assert_eq!(tool_input(""), json!({}));
+        assert_eq!(
+            tool_input("{not json"),
+            json!({"raw_arguments": "{not json"})
+        );
+    }
+
+    fn backend_with_tool_choice(tool_choice: Option<LlmToolChoice>) -> BedrockBackend {
+        BedrockBackend::new(
+            "us-east-1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            tool_choice,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn tool_history() -> Vec<ChatMessage> {
+        history_to_messages(&[
+            LlmChatMessage::user().content("go").build(),
+            LlmChatMessage::assistant()
+                .tool_use(vec![call("a", "get_weather", "{}")])
+                .build(),
+            LlmChatMessage::user()
+                .tool_result(vec![call("a", "get_weather", "sunny")])
+                .build(),
+        ])
+    }
+
+    fn weather_tool() -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "get_weather".to_string(),
+            description: "Get weather".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            cache_control: None,
+        }]
+    }
+
+    fn tool_names(config: &ToolConfiguration) -> Vec<String> {
+        config
+            .tools()
+            .iter()
+            .filter_map(|t| match t {
+                Tool::ToolSpec(spec) => Some(spec.name().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_prepare_chat_request_tool_history_without_tools_gets_placeholder() {
+        let request = ChatRequest::new(tool_history());
+        let prepared = backend_with_tool_choice(None)
+            .prepare_chat_request(request)
+            .unwrap();
+
+        let config = prepared.tool_config.expect("tool_config should be present");
+        assert_eq!(tool_names(&config), vec![PLACEHOLDER_TOOL_NAME]);
+        // Converse requires the input schema to declare `"type": "object"`.
+        let Some(Tool::ToolSpec(spec)) = config.tools().first() else {
+            panic!("expected a tool spec");
+        };
+        let Some(ToolInputSchema::Json(Document::Object(schema))) = spec.input_schema() else {
+            panic!("expected a JSON object schema");
+        };
+        assert_eq!(
+            schema.get("type"),
+            Some(&Document::String("object".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_prepare_chat_request_tool_choice_none_hides_real_tools() {
+        let request = ChatRequest::new(tool_history()).with_tools(weather_tool());
+        let prepared = backend_with_tool_choice(Some(LlmToolChoice::None))
+            .prepare_chat_request(request)
+            .unwrap();
+
+        let config = prepared.tool_config.expect("tool_config should be present");
+        assert_eq!(tool_names(&config), vec![PLACEHOLDER_TOOL_NAME]);
+    }
+
+    #[test]
+    fn test_prepare_chat_request_tool_history_with_auto_keeps_real_tools_only() {
+        let request = ChatRequest::new(tool_history()).with_tools(weather_tool());
+        let prepared = backend_with_tool_choice(Some(LlmToolChoice::Auto))
+            .prepare_chat_request(request)
+            .unwrap();
+
+        let config = prepared.tool_config.expect("tool_config should be present");
+        assert_eq!(tool_names(&config), vec!["get_weather"]);
+    }
+
+    #[test]
+    fn test_prepare_chat_request_text_history_without_tools_has_no_tool_config() {
+        let request = ChatRequest::new(vec![ChatMessage::user("hello")]);
+        let prepared = backend_with_tool_choice(None)
+            .prepare_chat_request(request)
+            .unwrap();
+
+        assert!(prepared.tool_config.is_none());
     }
 
     #[test]
