@@ -83,6 +83,7 @@ struct PreparedChatRequest {
     tool_config: Option<ToolConfiguration>,
     inference_config: aws_sdk_bedrockruntime::types::InferenceConfiguration,
     output_config: Option<OutputConfig>,
+    additional_model_request_fields: Option<Document>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -331,6 +332,7 @@ impl BedrockBackend {
             tool_config,
             inference_config,
             output_config,
+            additional_model_request_fields,
         } = self.prepare_chat_request(request)?;
 
         let mut converse_request = client
@@ -353,6 +355,9 @@ impl BedrockBackend {
         if let Some(output_config) = output_config {
             converse_request = converse_request.output_config(output_config);
         }
+
+        converse_request =
+            converse_request.set_additional_model_request_fields(additional_model_request_fields);
 
         // Add inference configuration
         converse_request = converse_request.inference_config(inference_config);
@@ -619,6 +624,7 @@ impl BedrockBackend {
             tool_config,
             inference_config,
             output_config,
+            additional_model_request_fields,
         } = self.prepare_chat_request(request)?;
 
         let mut converse_request = client
@@ -640,6 +646,9 @@ impl BedrockBackend {
         if let Some(output_config) = output_config {
             converse_request = converse_request.output_config(output_config);
         }
+
+        converse_request =
+            converse_request.set_additional_model_request_fields(additional_model_request_fields);
 
         // Add inference configuration
         converse_request = converse_request.inference_config(inference_config);
@@ -717,6 +726,7 @@ impl BedrockBackend {
             tool_config,
             inference_config,
             output_config,
+            additional_model_request_fields,
         } = self.prepare_chat_request(request)?;
 
         let mut converse_request = client
@@ -736,6 +746,9 @@ impl BedrockBackend {
         if let Some(output_config) = output_config {
             converse_request = converse_request.output_config(output_config);
         }
+
+        converse_request =
+            converse_request.set_additional_model_request_fields(additional_model_request_fields);
 
         converse_request = converse_request.inference_config(inference_config);
 
@@ -1025,6 +1038,7 @@ impl BedrockBackend {
         }
 
         let effective_tool_choice = tool_choice.unwrap_or(LlmToolChoice::Auto);
+        let tools_disabled = matches!(effective_tool_choice, LlmToolChoice::None);
         let mut tool_config = None;
 
         if !bedrock_tools.is_empty() && !matches!(effective_tool_choice, LlmToolChoice::None) {
@@ -1065,8 +1079,22 @@ impl BedrockBackend {
             );
         }
 
-        if tool_config.is_none() && self.model_supports(&model_id, ModelCapability::ToolUse) {
-            tool_config = placeholder_tool_config(&messages)?;
+        let mut additional_model_request_fields = None;
+        if tool_config.is_none() && has_tool_blocks(&messages) {
+            if tools_disabled {
+                if !is_anthropic_model(&model_id) {
+                    return Err(BedrockError::UnsupportedOperation(format!(
+                        "Model {} cannot disable tools when the history contains tool calls",
+                        model_id.model_id()
+                    )));
+                }
+                tool_config = Some(placeholder_tool_config(true)?);
+                additional_model_request_fields = Some(Self::value_to_document(
+                    &json!({"tool_choice": {"type": "none"}}),
+                ));
+            } else if self.model_supports(&model_id, ModelCapability::ToolUse) {
+                tool_config = Some(placeholder_tool_config(false)?);
+            }
         }
 
         // Inference config
@@ -1085,6 +1113,7 @@ impl BedrockBackend {
             tool_config,
             inference_config,
             output_config,
+            additional_model_request_fields,
         })
     }
 
@@ -1772,19 +1801,9 @@ fn tool_input(arguments: &str) -> Value {
 const PLACEHOLDER_TOOL_NAME: &str = "internal_placeholder_tool";
 
 /// Converse rejects toolUse/toolResult blocks without a toolConfig. When history has them but
-/// no real tools are offered (none given, or tool choice is none), declare an uncallable
-/// placeholder so the request is valid and the model cannot call anything real.
-fn placeholder_tool_config(messages: &[Message]) -> Result<Option<ToolConfiguration>> {
-    let has_tool_blocks = messages.iter().flat_map(|m| m.content()).any(|block| {
-        matches!(
-            block,
-            ContentBlock::ToolUse(_) | ContentBlock::ToolResult(_)
-        )
-    });
-    if !has_tool_blocks {
-        return Ok(None);
-    }
-
+/// no real tools are offered, declare an uncallable placeholder so the request is valid.
+/// `enforce_none` omits the tool choice so the caller can disable tools via the model's own field.
+fn placeholder_tool_config(enforce_none: bool) -> Result<ToolConfiguration> {
     let invalid = |e: &dyn std::fmt::Debug| {
         BedrockError::InvalidRequest(format!("Failed to build placeholder tool: {:?}", e))
     };
@@ -1796,14 +1815,32 @@ fn placeholder_tool_config(messages: &[Message]) -> Result<Option<ToolConfigurat
         )))
         .build()
         .map_err(|e| invalid(&e))?;
+    // Bedrock rejects a toolChoice next to an additional `tool_choice` field.
+    let tool_choice = (!enforce_none).then(|| {
+        aws_sdk_bedrockruntime::types::ToolChoice::Auto(
+            aws_sdk_bedrockruntime::types::AutoToolChoice::builder().build(),
+        )
+    });
     ToolConfiguration::builder()
         .tools(Tool::ToolSpec(spec))
-        .tool_choice(aws_sdk_bedrockruntime::types::ToolChoice::Auto(
-            aws_sdk_bedrockruntime::types::AutoToolChoice::builder().build(),
-        ))
+        .set_tool_choice(tool_choice)
         .build()
-        .map(Some)
         .map_err(|e| invalid(&e))
+}
+
+fn has_tool_blocks(messages: &[Message]) -> bool {
+    messages.iter().flat_map(|m| m.content()).any(|block| {
+        matches!(
+            block,
+            ContentBlock::ToolUse(_) | ContentBlock::ToolResult(_)
+        )
+    })
+}
+
+/// Converse has no "none" tool choice; Anthropic models accept their native one as an
+/// additional request field. Other model families cannot disable tools with tool history.
+fn is_anthropic_model(model: &BedrockModel) -> bool {
+    model.model_id().contains("anthropic.")
 }
 
 /// Bedrock body for a Cohere rerank call over `documents` (1..=1000).
@@ -2144,8 +2181,8 @@ streaming = true
         .unwrap()
     }
 
-    fn tool_history() -> Vec<ChatMessage> {
-        history_to_messages(&[
+    fn llm_tool_history() -> Vec<LlmChatMessage> {
+        vec![
             LlmChatMessage::user().content("go").build(),
             LlmChatMessage::assistant()
                 .tool_use(vec![call("a", "get_weather", "{}")])
@@ -2153,7 +2190,11 @@ streaming = true
             LlmChatMessage::user()
                 .tool_result(vec![call("a", "get_weather", "sunny")])
                 .build(),
-        ])
+        ]
+    }
+
+    fn tool_history() -> Vec<ChatMessage> {
+        history_to_messages(&llm_tool_history())
     }
 
     fn weather_tool() -> Vec<ToolDefinition> {
@@ -2199,7 +2240,7 @@ streaming = true
     }
 
     #[test]
-    fn test_prepare_chat_request_tool_choice_none_hides_real_tools() {
+    fn test_prepare_chat_request_tool_choice_none_disables_tools_natively() {
         let request = ChatRequest::new(tool_history()).with_tools(weather_tool());
         let prepared = backend_with_tool_choice(Some(LlmToolChoice::None))
             .prepare_chat_request(request)
@@ -2207,6 +2248,135 @@ streaming = true
 
         let config = prepared.tool_config.expect("tool_config should be present");
         assert_eq!(tool_names(&config), vec![PLACEHOLDER_TOOL_NAME]);
+        assert!(config.tool_choice().is_none());
+        assert_eq!(
+            prepared
+                .additional_model_request_fields
+                .map(|fields| BedrockBackend::document_to_value(&fields)),
+            Some(json!({"tool_choice": {"type": "none"}}))
+        );
+    }
+
+    #[test]
+    fn test_prepare_chat_request_tool_choice_none_rejected_for_non_anthropic_models() {
+        let request = ChatRequest::new(tool_history());
+        let result = backend_with_tool_choice(Some(LlmToolChoice::None))
+            .with_model(BedrockModel::Direct(DirectModel::NovaProV1))
+            .prepare_chat_request(request);
+
+        assert!(matches!(result, Err(BedrockError::UnsupportedOperation(_))));
+    }
+
+    /// Backend whose client sends to `endpoint` (a local mock) with dummy credentials.
+    fn backend_against(endpoint: &str, tool_choice: Option<LlmToolChoice>) -> BedrockBackend {
+        let backend = backend_with_tool_choice(tool_choice);
+        let config = aws_sdk_bedrockruntime::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(aws_sdk_bedrockruntime::config::Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .credentials_provider(aws_credential_types::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .build();
+        assert!(backend.client.set(BedrockClient::from_conf(config)).is_ok());
+        backend
+    }
+
+    /// True when the Converse body disables tools via Anthropic's own `tool_choice`.
+    fn disables_tools_natively(request: &mockito::Request) -> bool {
+        let body: Value = request
+            .body()
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(bytes).ok())
+            .unwrap_or_default();
+        body["additionalModelRequestFields"] == json!({"tool_choice": {"type": "none"}})
+            && body["toolConfig"].get("toolChoice").is_none()
+            && body["toolConfig"]["tools"][0]["toolSpec"]["name"] == PLACEHOLDER_TOOL_NAME
+    }
+
+    #[tokio::test]
+    async fn test_chat_with_tools_sends_tool_choice_none_with_tool_history() {
+        let mut server = mockito::Server::new_async().await;
+        let converse = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"^/model/.+/converse$".into()),
+            )
+            .match_request(disables_tools_natively)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "output": {"message": {"role": "assistant", "content": [{"text": "done"}]}},
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+                    "metrics": {"latencyMs": 1}
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let backend = backend_against(&server.url(), Some(LlmToolChoice::None));
+
+        let response = backend
+            .chat_with_tools(&llm_tool_history(), None)
+            .await
+            .expect("request disabling tools should be accepted");
+
+        assert_eq!(response.text().as_deref(), Some("done"));
+        converse.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_with_tools_sends_tool_choice_none_with_tool_history() {
+        let mut server = mockito::Server::new_async().await;
+        // Only the request is under test; a 400 ends the stream without retries.
+        let converse_stream = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"^/model/.+/converse-stream$".into()),
+            )
+            .match_request(disables_tools_natively)
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"stop here"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let backend = backend_against(&server.url(), Some(LlmToolChoice::None));
+
+        if let Ok(mut stream) =
+            ChatProvider::chat_stream_with_tools(&backend, &llm_tool_history(), None).await
+        {
+            while stream.next().await.is_some() {}
+        }
+
+        converse_stream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_entry_points_reject_tool_choice_none_for_non_anthropic_models() {
+        let mut server = mockito::Server::new_async().await;
+        let any_request = server
+            .mock("POST", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let backend = backend_against(&server.url(), Some(LlmToolChoice::None))
+            .with_model(BedrockModel::Direct(DirectModel::NovaProV1));
+
+        let chat = backend.chat_with_tools(&llm_tool_history(), None).await;
+        let stream =
+            ChatProvider::chat_stream_with_tools(&backend, &llm_tool_history(), None).await;
+
+        assert!(chat
+            .err()
+            .is_some_and(|e| e.to_string().contains("cannot disable tools")));
+        assert!(stream
+            .err()
+            .is_some_and(|e| e.to_string().contains("cannot disable tools")));
+        any_request.assert_async().await;
     }
 
     #[test]
