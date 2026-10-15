@@ -94,6 +94,143 @@ struct BedrockToolUseState {
     started: bool,
 }
 
+/// One item of a Converse stream: a content chunk, or the token usage Bedrock
+/// sends in its metadata once the message has stopped.
+#[derive(Debug, Clone)]
+enum ConverseEvent {
+    Chunk(LlmStreamChunk),
+    Usage(UsageInfo),
+}
+
+/// Turns one Converse stream output into the events it stands for, in order.
+/// Tool inputs are assembled across deltas; a message stop closes any tool
+/// use still open before it reports its reason.
+fn converse_events(
+    output: ConverseStreamOutput,
+    tool_states: &mut HashMap<usize, BedrockToolUseState>,
+    pending: &mut VecDeque<ConverseEvent>,
+) {
+    match output {
+        ConverseStreamOutput::ContentBlockStart(start) => {
+            if let Some(ContentBlockStart::ToolUse(tool_use)) = start.start {
+                let index = usize::try_from(start.content_block_index).unwrap_or(0);
+                let state = tool_states.entry(index).or_default();
+                state.id = tool_use.tool_use_id().to_string();
+                state.name = tool_use.name().to_string();
+                if !state.started {
+                    state.started = true;
+                    pending.push_back(ConverseEvent::Chunk(LlmStreamChunk::ToolUseStart {
+                        index,
+                        id: state.id.clone(),
+                        name: state.name.clone(),
+                    }));
+                }
+            }
+        }
+        ConverseStreamOutput::ContentBlockDelta(delta) => match delta.delta {
+            Some(ContentBlockDelta::Text(text)) => {
+                if !text.is_empty() {
+                    pending.push_back(ConverseEvent::Chunk(LlmStreamChunk::Text(text)));
+                }
+            }
+            Some(ContentBlockDelta::ToolUse(tool_use)) => {
+                let index = usize::try_from(delta.content_block_index).unwrap_or(0);
+                let state = tool_states.entry(index).or_default();
+                if !tool_use.input.is_empty() {
+                    state.input_buffer.push_str(&tool_use.input);
+                    pending.push_back(ConverseEvent::Chunk(LlmStreamChunk::ToolUseInputDelta {
+                        index,
+                        partial_json: tool_use.input,
+                    }));
+                }
+            }
+            // Reasoning and other block kinds are not content.
+            _ => {}
+        },
+        ConverseStreamOutput::ContentBlockStop(stop) => {
+            let index = usize::try_from(stop.content_block_index).unwrap_or(0);
+            if let Some(state) = tool_states.remove(&index) {
+                if state.started {
+                    pending.push_back(ConverseEvent::Chunk(LlmStreamChunk::ToolUseComplete {
+                        index,
+                        tool_call: state.to_tool_call(),
+                    }));
+                }
+            }
+        }
+        ConverseStreamOutput::MessageStop(stop) => {
+            finish_tool_uses(tool_states, pending);
+            pending.push_back(ConverseEvent::Chunk(LlmStreamChunk::Done {
+                stop_reason: stop.stop_reason.as_str().to_string(),
+            }));
+        }
+        ConverseStreamOutput::Metadata(metadata) => {
+            if let Some(usage) = metadata.usage() {
+                pending.push_back(ConverseEvent::Usage(UsageInfo {
+                    input_tokens: usage.input_tokens() as u64,
+                    output_tokens: usage.output_tokens() as u64,
+                    total_tokens: (usage.input_tokens() + usage.output_tokens()) as u64,
+                }));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Completes every tool use still open, in no particular order.
+fn finish_tool_uses(
+    tool_states: &mut HashMap<usize, BedrockToolUseState>,
+    pending: &mut VecDeque<ConverseEvent>,
+) {
+    for (index, state) in tool_states.drain() {
+        if state.started {
+            pending.push_back(ConverseEvent::Chunk(LlmStreamChunk::ToolUseComplete {
+                index,
+                tool_call: state.to_tool_call(),
+            }));
+        }
+    }
+}
+
+/// The OpenAI-shaped chunk for one Converse event: text and complete tool
+/// calls as deltas, the usage as a final chunk with no choices, nothing for
+/// the rest.
+fn struct_response(event: ConverseEvent) -> Option<StreamResponse> {
+    match event {
+        ConverseEvent::Chunk(LlmStreamChunk::Text(text)) => Some(StreamResponse {
+            choices: vec![StreamChoice {
+                delta: StreamDelta {
+                    content: Some(text),
+                    tool_calls: None,
+                },
+            }],
+            usage: None,
+        }),
+        ConverseEvent::Chunk(LlmStreamChunk::ToolUseComplete { tool_call, .. }) => {
+            Some(StreamResponse {
+                choices: vec![StreamChoice {
+                    delta: StreamDelta {
+                        content: None,
+                        tool_calls: Some(vec![tool_call]),
+                    },
+                }],
+                usage: None,
+            })
+        }
+        ConverseEvent::Usage(usage) => Some(StreamResponse {
+            choices: vec![],
+            usage: Some(crate::chat::Usage {
+                prompt_tokens: usage.input_tokens as u32,
+                completion_tokens: usage.output_tokens as u32,
+                total_tokens: usage.total_tokens as u32,
+                completion_tokens_details: None,
+                prompt_tokens_details: None,
+            }),
+        }),
+        ConverseEvent::Chunk(_) => None,
+    }
+}
+
 impl BedrockToolUseState {
     fn to_tool_call(&self) -> ToolCall {
         let arguments = if self.input_buffer.is_empty() {
@@ -689,7 +826,7 @@ impl BedrockBackend {
                                 continue;
                             }
                             ConverseStreamOutput::MessageStop(stop) => {
-                                let finish_reason = Some(format!("{:?}", stop.stop_reason));
+                                let finish_reason = Some(stop.stop_reason.as_str().to_string());
                                 Some(ChatStreamChunk {
                                     delta: String::new(),
                                     finish_reason,
@@ -717,6 +854,22 @@ impl BedrockBackend {
         &self,
         request: ChatRequest,
     ) -> Result<impl futures::Stream<Item = Result<LlmStreamChunk>>> {
+        let events = self.converse_stream(request).await?;
+        Ok(events.filter_map(|item| async move {
+            match item {
+                Ok(ConverseEvent::Chunk(chunk)) => Some(Ok(chunk)),
+                Ok(ConverseEvent::Usage(_)) => None,
+                Err(error) => Some(Err(error)),
+            }
+        }))
+    }
+
+    /// The Converse stream as content chunks and, after the message stops,
+    /// the turn's token usage.
+    async fn converse_stream(
+        &self,
+        request: ChatRequest,
+    ) -> Result<impl futures::Stream<Item = Result<ConverseEvent>>> {
         let client = self.get_client().await?;
         let PreparedChatRequest {
             model_id_str,
@@ -762,94 +915,25 @@ impl BedrockBackend {
         let initial_state = (
             stream,
             HashMap::<usize, BedrockToolUseState>::new(),
-            VecDeque::<LlmStreamChunk>::new(),
+            VecDeque::<ConverseEvent>::new(),
         );
 
         Ok(futures::stream::unfold(
             initial_state,
             |(mut stream, mut tool_states, mut pending)| async move {
                 loop {
-                    if let Some(chunk) = pending.pop_front() {
-                        return Some((Ok(chunk), (stream, tool_states, pending)));
+                    if let Some(event) = pending.pop_front() {
+                        return Some((Ok(event), (stream, tool_states, pending)));
                     }
 
-                    let next_item = stream.recv().await;
-                    match next_item {
-                        Ok(Some(event)) => match event {
-                            ConverseStreamOutput::ContentBlockStart(start) => {
-                                if let Some(ContentBlockStart::ToolUse(tool_use)) = start.start {
-                                    let index =
-                                        usize::try_from(start.content_block_index).unwrap_or(0);
-                                    let state = tool_states.entry(index).or_default();
-                                    state.id = tool_use.tool_use_id().to_string();
-                                    state.name = tool_use.name().to_string();
-                                    if !state.started {
-                                        state.started = true;
-                                        pending.push_back(LlmStreamChunk::ToolUseStart {
-                                            index,
-                                            id: state.id.clone(),
-                                            name: state.name.clone(),
-                                        });
-                                    }
-                                }
-                            }
-                            ConverseStreamOutput::ContentBlockDelta(delta) => match delta.delta {
-                                Some(ContentBlockDelta::Text(text)) => {
-                                    if !text.is_empty() {
-                                        pending.push_back(LlmStreamChunk::Text(text));
-                                    }
-                                }
-                                Some(ContentBlockDelta::ToolUse(tool_use)) => {
-                                    let index =
-                                        usize::try_from(delta.content_block_index).unwrap_or(0);
-                                    let state = tool_states.entry(index).or_default();
-                                    if !tool_use.input.is_empty() {
-                                        state.input_buffer.push_str(&tool_use.input);
-                                        pending.push_back(LlmStreamChunk::ToolUseInputDelta {
-                                            index,
-                                            partial_json: tool_use.input,
-                                        });
-                                    }
-                                }
-                                _ => {}
-                            },
-                            ConverseStreamOutput::ContentBlockStop(stop) => {
-                                let index = usize::try_from(stop.content_block_index).unwrap_or(0);
-                                if let Some(state) = tool_states.remove(&index) {
-                                    if state.started {
-                                        pending.push_back(LlmStreamChunk::ToolUseComplete {
-                                            index,
-                                            tool_call: state.to_tool_call(),
-                                        });
-                                    }
-                                }
-                            }
-                            ConverseStreamOutput::MessageStop(stop) => {
-                                for (index, state) in tool_states.drain() {
-                                    if state.started {
-                                        pending.push_back(LlmStreamChunk::ToolUseComplete {
-                                            index,
-                                            tool_call: state.to_tool_call(),
-                                        });
-                                    }
-                                }
-                                pending.push_back(LlmStreamChunk::Done {
-                                    stop_reason: stop.stop_reason.as_str().to_string(),
-                                });
-                            }
-                            _ => {}
-                        },
+                    match stream.recv().await {
+                        Ok(Some(output)) => {
+                            converse_events(output, &mut tool_states, &mut pending);
+                        }
                         Ok(None) => {
-                            for (index, state) in tool_states.drain() {
-                                if state.started {
-                                    pending.push_back(LlmStreamChunk::ToolUseComplete {
-                                        index,
-                                        tool_call: state.to_tool_call(),
-                                    });
-                                }
-                            }
-                            if let Some(chunk) = pending.pop_front() {
-                                return Some((Ok(chunk), (stream, tool_states, pending)));
+                            finish_tool_uses(&mut tool_states, &mut pending);
+                            if let Some(event) = pending.pop_front() {
+                                return Some((Ok(event), (stream, tool_states, pending)));
                             }
                             return None;
                         }
@@ -1563,32 +1647,14 @@ impl ChatProvider for BedrockBackend {
         let aws_messages = history_to_messages(messages);
 
         let request = ChatRequest::new(aws_messages);
-        let stream = BedrockBackend::chat_stream_with_tools(self, request)
+        let stream = self
+            .converse_stream(request)
             .await
             .map_err(|e| crate::error::LLMError::ProviderError(e.to_string()))?;
 
         let stream = stream.filter_map(|item| async move {
             match item {
-                Ok(LlmStreamChunk::Text(text)) => Some(Ok(StreamResponse {
-                    choices: vec![StreamChoice {
-                        delta: StreamDelta {
-                            content: Some(text),
-                            tool_calls: None,
-                        },
-                    }],
-                    usage: None,
-                })),
-                Ok(LlmStreamChunk::ToolUseComplete { tool_call, .. }) => Some(Ok(StreamResponse {
-                    choices: vec![StreamChoice {
-                        delta: StreamDelta {
-                            content: None,
-                            tool_calls: Some(vec![tool_call]),
-                        },
-                    }],
-                    usage: None,
-                })),
-                Ok(LlmStreamChunk::Done { .. }) => None,
-                Ok(_) => None,
+                Ok(event) => struct_response(event).map(Ok),
                 Err(e) => Some(Err(crate::error::LLMError::ProviderError(e.to_string()))),
             }
         });
@@ -2024,6 +2090,76 @@ streaming = true
         assert_eq!(tools.len(), 2);
         assert!(matches!(tools[0], Tool::ToolSpec(_)));
         assert!(matches!(tools[1], Tool::CachePoint(_)));
+    }
+
+    #[test]
+    fn a_max_tokens_stop_with_no_text_reports_its_reason_then_the_usage() {
+        use aws_sdk_bedrockruntime::types::{
+            ConverseStreamMetadataEvent, MessageStopEvent, StopReason, TokenUsage,
+        };
+        let mut tool_states = HashMap::new();
+        let mut pending = VecDeque::new();
+        let stop = MessageStopEvent::builder()
+            .stop_reason(StopReason::MaxTokens)
+            .build()
+            .unwrap();
+        converse_events(
+            ConverseStreamOutput::MessageStop(stop),
+            &mut tool_states,
+            &mut pending,
+        );
+        let usage = TokenUsage::builder()
+            .input_tokens(100)
+            .output_tokens(1024)
+            .total_tokens(1124)
+            .build()
+            .unwrap();
+        let metadata = ConverseStreamMetadataEvent::builder().usage(usage).build();
+        converse_events(
+            ConverseStreamOutput::Metadata(metadata),
+            &mut tool_states,
+            &mut pending,
+        );
+
+        let events: Vec<ConverseEvent> = pending.into_iter().collect();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            matches!(
+                &events[0],
+                ConverseEvent::Chunk(LlmStreamChunk::Done { stop_reason }) if stop_reason == "max_tokens"
+            ),
+            "{events:?}"
+        );
+        match &events[1] {
+            ConverseEvent::Usage(usage) => {
+                assert_eq!(usage.input_tokens, 100);
+                assert_eq!(usage.output_tokens, 1024);
+                assert_eq!(usage.total_tokens, 1124);
+            }
+            other => panic!("expected the usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_struct_stream_carries_the_usage_as_a_final_chunk_without_choices() {
+        let response = struct_response(ConverseEvent::Usage(UsageInfo {
+            input_tokens: 100,
+            output_tokens: 1024,
+            total_tokens: 1124,
+        }))
+        .expect("the usage is a chunk");
+        assert!(response.choices.is_empty());
+        let usage = response.usage.expect("the usage is on the chunk");
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 1024);
+        assert_eq!(usage.total_tokens, 1124);
+        assert!(
+            struct_response(ConverseEvent::Chunk(LlmStreamChunk::Done {
+                stop_reason: "max_tokens".into(),
+            }))
+            .is_none(),
+            "a stop has no OpenAI-shaped chunk to ride on"
+        );
     }
 
     #[test]
