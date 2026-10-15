@@ -1188,6 +1188,7 @@ pub fn create_sse_stream(
                             content: None,
                             tool_calls: Some(vec![self.tool_buffer.clone()]),
                         },
+                        finish_reason: None,
                     }],
                     usage: None,
                 }));
@@ -1216,6 +1217,7 @@ pub fn create_sse_stream(
                                         content: None,
                                         tool_calls: None,
                                     },
+                                    finish_reason: None,
                                 }],
                                 usage: Some(usage),
                             }));
@@ -1283,6 +1285,7 @@ pub fn create_sse_stream(
                                         content,
                                         tool_calls,
                                     },
+                                    finish_reason: None,
                                 }],
                                 usage: None,
                             }));

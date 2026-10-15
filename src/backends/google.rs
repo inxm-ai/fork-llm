@@ -1345,6 +1345,7 @@ fn parse_google_sse_chunk(chunk: &str) -> Result<Option<crate::chat::StreamRespo
                                     content,
                                     tool_calls: None,
                                 },
+                                finish_reason: None,
                             }],
                             usage,
                         }));
