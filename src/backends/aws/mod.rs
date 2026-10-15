@@ -203,6 +203,7 @@ fn struct_response(event: ConverseEvent) -> Option<StreamResponse> {
                     content: Some(text),
                     tool_calls: None,
                 },
+                finish_reason: None,
             }],
             usage: None,
         }),
@@ -213,10 +214,21 @@ fn struct_response(event: ConverseEvent) -> Option<StreamResponse> {
                         content: None,
                         tool_calls: Some(vec![tool_call]),
                     },
+                    finish_reason: None,
                 }],
                 usage: None,
             })
         }
+        ConverseEvent::Chunk(LlmStreamChunk::Done { stop_reason }) => Some(StreamResponse {
+            choices: vec![StreamChoice {
+                delta: StreamDelta {
+                    content: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some(finish_reason_of(&stop_reason)),
+            }],
+            usage: None,
+        }),
         ConverseEvent::Usage(usage) => Some(StreamResponse {
             choices: vec![],
             usage: Some(crate::chat::Usage {
@@ -229,6 +241,19 @@ fn struct_response(event: ConverseEvent) -> Option<StreamResponse> {
         }),
         ConverseEvent::Chunk(_) => None,
     }
+}
+
+/// Bedrock's stop reason in OpenAI's words; one it has no word for is
+/// passed on as it came.
+fn finish_reason_of(stop_reason: &str) -> String {
+    match stop_reason {
+        "end_turn" | "stop_sequence" => "stop",
+        "max_tokens" => "length",
+        "tool_use" => "tool_calls",
+        "content_filtered" | "guardrail_intervened" => "content_filter",
+        other => other,
+    }
+    .to_string()
 }
 
 impl BedrockToolUseState {
@@ -2153,13 +2178,23 @@ streaming = true
         assert_eq!(usage.prompt_tokens, 100);
         assert_eq!(usage.completion_tokens, 1024);
         assert_eq!(usage.total_tokens, 1124);
-        assert!(
-            struct_response(ConverseEvent::Chunk(LlmStreamChunk::Done {
-                stop_reason: "max_tokens".into(),
-            }))
-            .is_none(),
-            "a stop has no OpenAI-shaped chunk to ride on"
-        );
+    }
+
+    #[test]
+    fn the_struct_stream_names_the_stop_in_openai_words_on_an_empty_choice() {
+        let response = struct_response(ConverseEvent::Chunk(LlmStreamChunk::Done {
+            stop_reason: "max_tokens".into(),
+        }))
+        .expect("a stop is a chunk");
+        assert_eq!(response.choices.len(), 1);
+        let choice = &response.choices[0];
+        assert!(choice.delta.content.is_none() && choice.delta.tool_calls.is_none());
+        assert_eq!(choice.finish_reason.as_deref(), Some("length"));
+        assert!(response.usage.is_none());
+        assert_eq!(finish_reason_of("end_turn"), "stop");
+        assert_eq!(finish_reason_of("tool_use"), "tool_calls");
+        assert_eq!(finish_reason_of("guardrail_intervened"), "content_filter");
+        assert_eq!(finish_reason_of("something_new"), "something_new");
     }
 
     #[test]

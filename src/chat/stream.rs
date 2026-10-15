@@ -19,6 +19,10 @@ pub struct StreamResponse {
 pub struct StreamChoice {
     /// Delta containing the incremental content
     pub delta: StreamDelta,
+    /// Why the stream stopped, on its last choice: `stop`, `length`,
+    /// `tool_calls` or `content_filter`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 /// Delta content in a streaming response
