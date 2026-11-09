@@ -9,7 +9,7 @@ mod usage;
 pub use message::{
     ChatMessage, ChatMessageBuilder, ChatRole, ImageMime, MessageType, ReasoningEffort,
 };
-pub use stream::{StreamChoice, StreamChunk, StreamDelta, StreamResponse};
+pub use stream::{finish_reason_of, StreamChoice, StreamChunk, StreamDelta, StreamResponse};
 pub use tool::{
     FunctionTool, ParameterProperty, ParametersSchema, StructuredOutputFormat, Tool, ToolChoice,
 };

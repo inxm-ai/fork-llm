@@ -8,8 +8,8 @@ use std::sync::Arc;
 use crate::{
     builder::{LLMBackend, SystemContent, SystemPrompt},
     chat::{
-        ChatMessage, ChatProvider, ChatResponse, ChatRole, MessageType, StreamChunk, Tool,
-        ToolChoice, Usage,
+        ChatMessage, ChatProvider, ChatResponse, ChatRole, MessageType, StreamChunk,
+        StreamResponse, Tool, ToolChoice, Usage,
     },
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
@@ -252,6 +252,104 @@ struct AnthropicStreamResponse {
     content_block: Option<AnthropicStreamContentBlock>,
     /// Delta for content_block_delta and message_delta events
     delta: Option<AnthropicDelta>,
+    /// The message of a message_start event, with the prompt's token counts
+    message: Option<AnthropicStreamMessage>,
+    /// The counts a message_delta event carries: the output tokens so far,
+    /// and on newer API versions the input tokens as well
+    usage: Option<AnthropicStreamUsage>,
+}
+
+/// The message of a message_start event; only its usage is read.
+#[derive(Deserialize, Debug)]
+struct AnthropicStreamMessage {
+    usage: Option<AnthropicStreamUsage>,
+}
+
+/// Token counts in a streaming event; every field is optional because
+/// message_start and message_delta each carry a different subset.
+#[derive(Deserialize, Debug, Default, Clone, Copy)]
+struct AnthropicStreamUsage {
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    cache_creation_input_tokens: Option<u32>,
+    cache_read_input_tokens: Option<u32>,
+}
+
+/// What a stream has said about its prompt so far: message_start reports the
+/// prompt's tokens, message_delta the output's (and, on newer API versions,
+/// the prompt's again).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct AnthropicUsageState {
+    input_tokens: u32,
+    cache_creation_input_tokens: u32,
+    cache_read_input_tokens: u32,
+}
+
+impl AnthropicUsageState {
+    fn record(&mut self, usage: &AnthropicStreamUsage) {
+        if let Some(input) = usage.input_tokens {
+            self.input_tokens = input;
+        }
+        if let Some(created) = usage.cache_creation_input_tokens {
+            self.cache_creation_input_tokens = created;
+        }
+        if let Some(read) = usage.cache_read_input_tokens {
+            self.cache_read_input_tokens = read;
+        }
+    }
+
+    fn usage(&self, output_tokens: u32) -> Usage {
+        let cached_tokens = self.cache_creation_input_tokens + self.cache_read_input_tokens;
+        Usage {
+            prompt_tokens: self.input_tokens,
+            completion_tokens: output_tokens,
+            total_tokens: self.input_tokens + output_tokens,
+            completion_tokens_details: None,
+            prompt_tokens_details: if cached_tokens > 0 {
+                Some(crate::chat::PromptTokensDetails {
+                    cached_tokens: Some(cached_tokens),
+                    audio_tokens: None,
+                })
+            } else {
+                None
+            },
+        }
+    }
+}
+
+/// The token usage a streaming event completes, if any: message_start is
+/// remembered in `state`, and a message_delta that carries output tokens
+/// yields the response's usage (the same counts the non-streaming reply
+/// reports). Other events yield nothing.
+pub(crate) fn parse_anthropic_usage_event(
+    chunk: &str,
+    state: &mut AnthropicUsageState,
+) -> Option<Usage> {
+    for line in chunk.lines() {
+        let Some(data) = line.trim().strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(response) = serde_json::from_str::<AnthropicStreamResponse>(data) else {
+            continue;
+        };
+        match response.response_type.as_str() {
+            "message_start" => {
+                if let Some(usage) = response.message.and_then(|m| m.usage) {
+                    state.record(&usage);
+                }
+            }
+            "message_delta" => {
+                if let Some(usage) = response.usage {
+                    state.record(&usage);
+                    if let Some(output_tokens) = usage.output_tokens {
+                        return Some(state.usage(output_tokens));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Content block within an Anthropic streaming content_block_start event.
@@ -987,6 +1085,27 @@ impl ChatProvider for Anthropic {
     /// # Returns
     ///
     /// A stream of `StreamChunk` items or an error
+    /// The tool stream in OpenAI's chunk shape: text and tool calls as
+    /// deltas, the stop as `finish_reason`, and the usage as a last
+    /// choice-less chunk, so a router can forward it like any other provider.
+    async fn chat_stream_struct(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<StreamResponse, LLMError>> + Send>>,
+        LLMError,
+    > {
+        use futures::stream::StreamExt;
+
+        let stream = self.chat_stream_with_tools(messages, None).await?;
+        Ok(Box::pin(stream.filter_map(|item| async move {
+            match item {
+                Ok(chunk) => StreamResponse::from_chunk(chunk).map(Ok),
+                Err(e) => Some(Err(e)),
+            }
+        })))
+    }
+
     async fn chat_stream_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -1216,8 +1335,8 @@ pub(crate) fn create_anthropic_tool_stream(
     let stream = response
         .bytes_stream()
         .scan(
-            (String::new(), Vec::new(), HashMap::new()),
-            move |(buffer, utf8_buffer, tool_states), chunk| {
+            (String::new(), Vec::new(), HashMap::new(), AnthropicUsageState::default()),
+            move |(buffer, utf8_buffer, tool_states, usage_state), chunk| {
                 let result = match chunk {
                     Ok(bytes) => {
                         utf8_buffer.extend_from_slice(&bytes);
@@ -1244,6 +1363,12 @@ pub(crate) fn create_anthropic_tool_stream(
                             let event = buffer[..pos + 2].to_string();
                             buffer.drain(..pos + 2);
 
+                            // The message_delta that ends the message carries
+                            // the counts and the stop reason; the usage goes
+                            // out first, so a reader that stops at Done has it.
+                            if let Some(usage) = parse_anthropic_usage_event(&event, usage_state) {
+                                results.push(Ok(StreamChunk::Usage(usage)));
+                            }
                             match parse_anthropic_sse_chunk_with_tools(&event, tool_states) {
                                 Ok(Some(chunk)) => results.push(Ok(chunk)),
                                 Ok(None) => {}
@@ -1944,6 +2069,108 @@ data: {"type": "message_delta", "delta": {"stop_reason": "tool_use"}}
             }
             _ => panic!("Expected Done chunk, got {:?}", result),
         }
+    }
+
+    #[test]
+    fn usage_is_completed_by_the_message_delta_that_ends_the_message() {
+        let mut state = AnthropicUsageState::default();
+        let start = r#"event: message_start
+data: {"type": "message_start", "message": {"id": "msg_1", "usage": {"input_tokens": 332, "output_tokens": 1, "cache_read_input_tokens": 300}}}
+
+"#;
+        assert!(parse_anthropic_usage_event(start, &mut state).is_none());
+        let text = r#"event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hi"}}
+
+"#;
+        assert!(parse_anthropic_usage_event(text, &mut state).is_none());
+        let delta = r#"event: message_delta
+data: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}}
+
+"#;
+        let usage = parse_anthropic_usage_event(delta, &mut state).expect("usage");
+        assert_eq!(usage.prompt_tokens, 332);
+        assert_eq!(usage.completion_tokens, 7);
+        assert_eq!(usage.total_tokens, 339);
+        assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, Some(300));
+    }
+
+    #[test]
+    fn a_message_delta_without_counts_completes_no_usage() {
+        let mut state = AnthropicUsageState::default();
+        let delta = r#"event: message_delta
+data: {"type": "message_delta", "delta": {"stop_reason": "tool_use"}}
+
+"#;
+        assert!(parse_anthropic_usage_event(delta, &mut state).is_none());
+    }
+
+    fn sse_response(body: &str) -> reqwest::Response {
+        http::Response::builder()
+            .status(http::StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(body.to_string())
+            .unwrap()
+            .into()
+    }
+
+    #[tokio::test]
+    async fn the_tool_stream_sends_usage_before_done() {
+        use futures::StreamExt;
+
+        let body = concat!(
+            "event: message_start
+",
+            r#"data: {"type": "message_start", "message": {"usage": {"input_tokens": 12, "output_tokens": 1}}}"#,
+            "
+
+",
+            "event: content_block_delta
+",
+            r#"data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hey"}}"#,
+            "
+
+",
+            "event: message_delta
+",
+            r#"data: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}"#,
+            "
+
+",
+        );
+        let chunks: Vec<StreamChunk> = create_anthropic_tool_stream(sse_response(body))
+            .map(|item| item.unwrap())
+            .collect()
+            .await;
+        assert!(matches!(&chunks[0], StreamChunk::Text(t) if t == "Hey"));
+        assert!(matches!(&chunks[1], StreamChunk::Usage(u) if u.total_tokens == 15));
+        assert!(matches!(&chunks[2], StreamChunk::Done { stop_reason } if stop_reason == "end_turn"));
+        assert_eq!(chunks.len(), 3);
+    }
+
+    #[test]
+    fn stream_responses_of_chunks_follow_openai_s_shape() {
+        let usage = StreamResponse::from_chunk(StreamChunk::Usage(Usage {
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: 3,
+            completion_tokens_details: None,
+            prompt_tokens_details: None,
+        }))
+        .unwrap();
+        assert!(usage.choices.is_empty());
+        assert_eq!(usage.usage.unwrap().total_tokens, 3);
+        let done = StreamResponse::from_chunk(StreamChunk::Done {
+            stop_reason: "max_tokens".into(),
+        })
+        .unwrap();
+        assert_eq!(done.choices[0].finish_reason.as_deref(), Some("length"));
+        assert!(StreamResponse::from_chunk(StreamChunk::ToolUseStart {
+            index: 0,
+            id: "t".into(),
+            name: "n".into()
+        })
+        .is_none());
     }
 
     #[test]

@@ -28,7 +28,8 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 
 use crate::chat::{
-    ChatMessage as LlmChatMessage, ChatProvider, StreamChoice, StreamChunk as LlmStreamChunk,
+    finish_reason_of, ChatMessage as LlmChatMessage, ChatProvider, StreamChoice,
+    StreamChunk as LlmStreamChunk,
     StreamDelta, StreamResponse, StructuredOutputFormat, Tool as LlmTool,
     ToolChoice as LlmToolChoice,
 };
@@ -241,19 +242,6 @@ fn struct_response(event: ConverseEvent) -> Option<StreamResponse> {
         }),
         ConverseEvent::Chunk(_) => None,
     }
-}
-
-/// Bedrock's stop reason in OpenAI's words; one it has no word for is
-/// passed on as it came.
-fn finish_reason_of(stop_reason: &str) -> String {
-    match stop_reason {
-        "end_turn" | "stop_sequence" => "stop",
-        "max_tokens" => "length",
-        "tool_use" => "tool_calls",
-        "content_filtered" | "guardrail_intervened" => "content_filter",
-        other => other,
-    }
-    .to_string()
 }
 
 impl BedrockToolUseState {
