@@ -17,4 +17,4 @@ pub use traits::{ChatProvider, ChatResponse};
 pub use usage::{CompletionTokensDetails, PromptTokensDetails, Usage};
 
 pub(crate) use guards::ensure_no_audio;
-pub(crate) use sse::create_sse_stream;
+pub(crate) use sse::{create_sse_stream, SseLineBuffer};
