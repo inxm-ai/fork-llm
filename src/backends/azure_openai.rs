@@ -884,13 +884,16 @@ fn create_azure_sse_stream_with_tools(
     let bytes_stream = response.bytes_stream();
     let stream = bytes_stream
         .scan(
-            (String::new(), HashMap::<usize, AzureToolUseState>::new()),
-            |(event_buffer, tool_states), chunk| {
+            (
+                String::new(),
+                HashMap::<usize, AzureToolUseState>::new(),
+                crate::chat::SseLineBuffer::default(),
+            ),
+            |(event_buffer, tool_states, lines), chunk| {
                 let results = match chunk {
                     Ok(bytes) => {
-                        let text = String::from_utf8_lossy(&bytes);
                         let mut results = Vec::new();
-                        for line in text.lines() {
+                        for line in lines.push(&bytes) {
                             let line = line.trim_end();
                             if line.is_empty() {
                                 if !event_buffer.is_empty() {
