@@ -81,6 +81,7 @@ impl ToolStreamState {
                 self.handle_tool_complete(tool_call, ctx).await;
                 Ok(true)
             }
+            StreamChunk::Usage(_) => Ok(true),
             StreamChunk::Done { .. } => Ok(false),
         }
     }
