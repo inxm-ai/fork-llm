@@ -98,7 +98,7 @@ impl SseState {
 ///
 /// A network read can end anywhere, including inside a line (`da` | `ta: {...}`)
 /// or a multi-byte UTF-8 character. Splitting each read on its own line breaks
-/// turns such a line into two broken ones, and the event they carried is
+/// such a line into two broken ones, and the event they carried is
 /// dropped. This keeps the unterminated tail until the read that completes it.
 #[derive(Default)]
 pub(crate) struct SseLineBuffer {
