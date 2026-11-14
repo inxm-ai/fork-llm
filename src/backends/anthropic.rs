@@ -64,7 +64,8 @@ pub struct AnthropicConfig {
     pub reasoning: bool,
     /// Budget tokens for extended thinking.
     pub thinking_budget_tokens: Option<u32>,
-    /// Native structured output configuration sent to the Messages API.
+    /// `output_config` sent to the Messages API: the native structured output
+    /// `format` and/or the `effort` level ([`Anthropic::with_effort`]).
     pub output_config: Option<Value>,
     /// Original constraints enforced locally when the native schema is adapted,
     /// or when native output is unavailable for the schema at all. Streamed
@@ -819,6 +820,23 @@ impl Anthropic {
             config.output_schema_instruction = None;
         }
         Ok(self)
+    }
+
+    /// Set `output_config.effort` ("low", "medium", "high", ...), which bounds
+    /// how much Claude 4.6+ models think and write. Claude Haiku 5.5, Sonnet
+    /// 5.5 and Opus 5.5 think adaptively by default, and that thinking counts
+    /// against `max_tokens`: a short classification call can spend its whole
+    /// budget thinking and return nothing. Kept alongside any structured
+    /// output `format`, so call it after [`Self::with_structured_output`].
+    pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
+        let config = Arc::make_mut(&mut self.config);
+        let mut output_config = match config.output_config.take() {
+            Some(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        output_config.insert("effort".to_string(), Value::String(effort.into()));
+        config.output_config = Some(Value::Object(output_config));
+        self
     }
 
     async fn parse_completion_response(
@@ -1801,6 +1819,46 @@ mod tests {
             assert_eq!(wire["output_config"]["format"]["schema"], schema);
             assert!(wire.get("response_format").is_none());
         }
+    }
+
+    #[test]
+    fn builder_sends_effort_beside_the_structured_output_format() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"within": {"type": "boolean"}},
+            "required": ["within"],
+            "additionalProperties": false
+        });
+        let effort_only = Anthropic::new(
+            "test-key", None, None, None, None, None, None, None, None, None, None, None,
+        )
+        .with_effort("low");
+        assert_eq!(
+            effort_only.config.output_config,
+            Some(serde_json::json!({"effort": "low"}))
+        );
+
+        let both = Anthropic::new(
+            "test-key", None, None, None, None, None, None, None, None, None, None, None,
+        )
+        .with_structured_output(crate::chat::StructuredOutputFormat {
+            name: "verdict".to_string(),
+            description: None,
+            schema: Some(schema.clone()),
+            strict: Some(true),
+        })
+        .unwrap()
+        .with_effort("low");
+        let output_config = both.config.output_config.as_ref().unwrap();
+        assert_eq!(output_config["effort"], "low");
+        assert_eq!(output_config["format"]["schema"], schema);
+
+        let built = crate::builder::LLMBuilder::new()
+            .backend(crate::builder::LLMBackend::Anthropic)
+            .api_key("test-key")
+            .reasoning_effort(crate::chat::ReasoningEffort::Low)
+            .build();
+        assert!(built.is_ok());
     }
 
     #[test]

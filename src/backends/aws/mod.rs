@@ -1176,7 +1176,7 @@ impl BedrockBackend {
             );
         }
 
-        let mut additional_model_request_fields = None;
+        let mut additional_fields = serde_json::Map::new();
         if tool_config.is_none() && has_tool_blocks(&messages) {
             if tools_disabled {
                 if !is_anthropic_model(&model_id) {
@@ -1186,13 +1186,17 @@ impl BedrockBackend {
                     )));
                 }
                 tool_config = Some(placeholder_tool_config(true)?);
-                additional_model_request_fields = Some(Self::value_to_document(
-                    &json!({"tool_choice": {"type": "none"}}),
-                ));
+                additional_fields.insert("tool_choice".to_string(), json!({"type": "none"}));
             } else if self.model_supports(&model_id, ModelCapability::ToolUse) {
                 tool_config = Some(placeholder_tool_config(false)?);
             }
         }
+
+        if let Some(effort) = self.claude_effort(&model_id, output_config.is_some()) {
+            additional_fields.insert("output_config".to_string(), json!({"effort": effort}));
+        }
+        let additional_model_request_fields = (!additional_fields.is_empty())
+            .then(|| Self::value_to_document(&Value::Object(additional_fields)));
 
         // Inference config
         let inference_config = aws_sdk_bedrockruntime::types::InferenceConfiguration::builder()
@@ -1436,6 +1440,22 @@ impl BedrockBackend {
                 media_type
             ))),
         }
+    }
+
+    /// The `effort` to send a Claude model through the Messages API fields
+    /// Converse passes on (`additionalModelRequestFields.output_config`).
+    /// Not sent with Converse's own `outputConfig` (structured output), so the
+    /// two never meet in one request, nor to non-Claude models.
+    fn claude_effort(&self, model: &BedrockModel, structured: bool) -> Option<&str> {
+        let effort = self.reasoning_effort.as_deref()?;
+        if !is_anthropic_model(model) {
+            return None;
+        }
+        if structured {
+            log::debug!("effort {effort} not sent with Converse structured output");
+            return None;
+        }
+        Some(effort)
     }
 
     fn value_to_document(value: &Value) -> Document {
@@ -2424,6 +2444,65 @@ streaming = true
             .prepare_chat_request(request);
 
         assert!(matches!(result, Err(BedrockError::UnsupportedOperation(_))));
+    }
+
+    fn backend_with_effort(effort: &str) -> BedrockBackend {
+        BedrockBackend {
+            reasoning_effort: Some(effort.to_string()),
+            ..backend_with_tool_choice(None)
+        }
+    }
+
+    fn effort_fields(prepared: PreparedChatRequest) -> Option<Value> {
+        prepared
+            .additional_model_request_fields
+            .map(|fields| BedrockBackend::document_to_value(&fields))
+    }
+
+    #[test]
+    fn test_prepare_chat_request_sends_effort_to_claude() {
+        let request = ChatRequest::new(history_to_messages(&[LlmChatMessage::user()
+            .content("go")
+            .build()]));
+        let prepared = backend_with_effort("low")
+            .prepare_chat_request(request)
+            .unwrap();
+
+        assert_eq!(
+            effort_fields(prepared),
+            Some(json!({"output_config": {"effort": "low"}}))
+        );
+    }
+
+    #[test]
+    fn test_prepare_chat_request_keeps_effort_beside_tool_choice_none() {
+        let backend = BedrockBackend {
+            tool_choice: Some(LlmToolChoice::None),
+            ..backend_with_effort("low")
+        };
+        let request = ChatRequest::new(tool_history()).with_tools(weather_tool());
+        let prepared = backend.prepare_chat_request(request).unwrap();
+
+        assert_eq!(
+            effort_fields(prepared),
+            Some(json!({
+                "tool_choice": {"type": "none"},
+                "output_config": {"effort": "low"}
+            }))
+        );
+    }
+
+    #[test]
+    fn test_prepare_chat_request_sends_no_effort_to_other_models() {
+        let request = ChatRequest::new(history_to_messages(&[LlmChatMessage::user()
+            .content("go")
+            .build()]));
+        let prepared = backend_with_effort("low")
+            .with_model(BedrockModel::Direct(DirectModel::NovaProV1))
+            .prepare_chat_request(request)
+            .unwrap();
+
+        assert_eq!(effort_fields(prepared), None);
     }
 
     /// Backend whose client sends to `endpoint` (a local mock) with dummy credentials.
