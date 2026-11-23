@@ -1559,26 +1559,15 @@ mod tests {
             .with_body(r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#)
             .create_async()
             .await;
-        let client = AzureOpenAI::with_client(
-            Client::new(),
-            "test-key",
-            None,
-            "gpt-6-luna",
-            server.url(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(crate::chat::ReasoningEffort::None.to_string()),
-            None,
-        );
+        let client = crate::builder::LLMBuilder::new()
+            .backend(crate::builder::LLMBackend::AzureOpenAI)
+            .api_key("test-key")
+            .base_url(server.url())
+            .deployment_id("gpt-6-luna")
+            .reasoning_effort(crate::chat::ReasoningEffort::High)
+            .reasoning_effort_none()
+            .build()
+            .unwrap();
         let tool = Tool {
             tool_type: "function".to_string(),
             function: crate::chat::FunctionTool {
