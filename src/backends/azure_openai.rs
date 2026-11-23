@@ -1548,6 +1548,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_with_tools_sends_reasoning_effort_none() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", mockito::Matcher::Regex("chat/completions$".into()))
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "reasoning_effort": "none",
+                "tools": [{"type": "function", "function": {"name": "get_weather"}}]
+            })))
+            .with_body(r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#)
+            .create_async()
+            .await;
+        let client = AzureOpenAI::with_client(
+            Client::new(),
+            "test-key",
+            None,
+            "gpt-6-luna",
+            server.url(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::chat::ReasoningEffort::None.to_string()),
+            None,
+        );
+        let tool = Tool {
+            tool_type: "function".to_string(),
+            function: crate::chat::FunctionTool {
+                name: "get_weather".to_string(),
+                description: "Weather for a city".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            cache_control: None,
+        };
+
+        client
+            .chat_with_tools(
+                &[ChatMessage::user().content("weather?").build()],
+                Some(&[tool]),
+            )
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn embed_batch_posts_model_inference_route_and_orders_by_index() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
