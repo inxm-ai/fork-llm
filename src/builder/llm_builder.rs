@@ -73,6 +73,14 @@ impl LLMBuilder {
         self
     }
 
+    /// Sends an explicit `reasoning_effort: "none"` on OpenAI and Azure OpenAI,
+    /// where some models require it to use function tools. Anthropic and
+    /// Bedrock omit the effort and use the model's default instead.
+    pub fn reasoning_effort_none(mut self) -> Self {
+        self.state.reasoning_effort = Some("none".to_string());
+        self
+    }
+
     /// Sets the reasoning flag.
     pub fn reasoning(mut self, reasoning: bool) -> Self {
         self.state.reasoning = Some(reasoning);

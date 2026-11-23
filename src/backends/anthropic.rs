@@ -828,19 +828,20 @@ impl Anthropic {
     /// against `max_tokens`: a short classification call can spend its whole
     /// budget thinking and return nothing. Kept alongside any structured
     /// output `format`, so call it after [`Self::with_structured_output`].
+    /// Passing `"none"` clears the effort and restores the model's default.
     pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
         let effort = effort.into();
-        // Claude has no "none" level: no effort means the default.
-        if effort == "none" {
-            return self;
-        }
         let config = Arc::make_mut(&mut self.config);
         let mut output_config = match config.output_config.take() {
             Some(Value::Object(map)) => map,
             _ => serde_json::Map::new(),
         };
-        output_config.insert("effort".to_string(), Value::String(effort));
-        config.output_config = Some(Value::Object(output_config));
+        if effort == "none" {
+            output_config.remove("effort");
+        } else {
+            output_config.insert("effort".to_string(), Value::String(effort));
+        }
+        config.output_config = (!output_config.is_empty()).then_some(Value::Object(output_config));
         self
     }
 
@@ -1873,6 +1874,32 @@ mod tests {
         )
         .with_effort("none");
         assert_eq!(provider.config.output_config, None);
+    }
+
+    #[test]
+    fn none_clears_existing_effort_without_clearing_format() {
+        let provider = Anthropic::new(
+            "test-key", None, None, None, None, None, None, None, None, None, None, None,
+        );
+        let reset = provider.clone().with_effort("low").with_effort("none");
+        assert_eq!(reset.config.output_config, None);
+
+        let structured = provider
+            .with_structured_output(crate::chat::StructuredOutputFormat {
+                name: "verdict".to_string(),
+                description: None,
+                schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"within": {"type": "boolean"}},
+                    "required": ["within"],
+                    "additionalProperties": false
+                })),
+                strict: Some(true),
+            })
+            .unwrap();
+        assert!(structured.config.output_config.is_some());
+        let reset = structured.clone().with_effort("low").with_effort("none");
+        assert_eq!(reset.config.output_config, structured.config.output_config);
     }
 
     #[test]
