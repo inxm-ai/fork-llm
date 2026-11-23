@@ -829,12 +829,17 @@ impl Anthropic {
     /// budget thinking and return nothing. Kept alongside any structured
     /// output `format`, so call it after [`Self::with_structured_output`].
     pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
+        let effort = effort.into();
+        // Claude has no "none" level: no effort means the default.
+        if effort == "none" {
+            return self;
+        }
         let config = Arc::make_mut(&mut self.config);
         let mut output_config = match config.output_config.take() {
             Some(Value::Object(map)) => map,
             _ => serde_json::Map::new(),
         };
-        output_config.insert("effort".to_string(), Value::String(effort.into()));
+        output_config.insert("effort".to_string(), Value::String(effort));
         config.output_config = Some(Value::Object(output_config));
         self
     }
@@ -1859,6 +1864,15 @@ mod tests {
             .reasoning_effort(crate::chat::ReasoningEffort::Low)
             .build();
         assert!(built.is_ok());
+    }
+
+    #[test]
+    fn no_effort_is_sent_for_none() {
+        let provider = Anthropic::new(
+            "test-key", None, None, None, None, None, None, None, None, None, None, None,
+        )
+        .with_effort("none");
+        assert_eq!(provider.config.output_config, None);
     }
 
     #[test]

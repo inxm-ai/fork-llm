@@ -58,6 +58,10 @@ pub enum MessageType {
 
 /// The type of reasoning effort for a message in a chat conversation.
 pub enum ReasoningEffort {
+    /// No reasoning (OpenAI's `none`). Some OpenAI models only take function
+    /// tools on `/chat/completions` with it. Providers without such a level
+    /// (Anthropic, Bedrock) leave the effort out.
+    None,
     /// Low reasoning effort
     Low,
     /// Medium reasoning effort
@@ -69,6 +73,7 @@ pub enum ReasoningEffort {
 impl fmt::Display for ReasoningEffort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
+            ReasoningEffort::None => "none",
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",

@@ -1448,7 +1448,8 @@ impl BedrockBackend {
     /// two never meet in one request, nor to non-Claude models.
     fn claude_effort(&self, model: &BedrockModel, structured: bool) -> Option<&str> {
         let effort = self.reasoning_effort.as_deref()?;
-        if !is_anthropic_model(model) {
+        // Claude has no "none" level: no effort means the default.
+        if effort == "none" || !is_anthropic_model(model) {
             return None;
         }
         if structured {
@@ -2490,6 +2491,18 @@ streaming = true
                 "output_config": {"effort": "low"}
             }))
         );
+    }
+
+    #[test]
+    fn test_prepare_chat_request_sends_no_effort_for_none() {
+        let request = ChatRequest::new(history_to_messages(&[LlmChatMessage::user()
+            .content("go")
+            .build()]));
+        let prepared = backend_with_effort("none")
+            .prepare_chat_request(request)
+            .unwrap();
+
+        assert_eq!(effort_fields(prepared), None);
     }
 
     #[test]
