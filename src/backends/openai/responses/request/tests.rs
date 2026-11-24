@@ -173,3 +173,79 @@ fn build_responses_request_for_input_allows_overrides() {
         _ => panic!("expected text input"),
     }
 }
+
+fn text_format_for(schema: serde_json::Value, strict: Option<bool>) -> serde_json::Value {
+    let mut config = base_config();
+    config.json_schema = Some(StructuredOutputFormat {
+        name: "r".to_string(),
+        description: None,
+        schema: Some(schema),
+        strict,
+    });
+    let message = ChatMessage::user().content("Hi").build();
+    let request = build_responses_request(ResponsesRequestParams {
+        config: &config,
+        messages: &[message],
+        tools: None,
+        stream: false,
+    })
+    .unwrap();
+    serde_json::to_value(&request).unwrap()["text"]["format"].clone()
+}
+
+#[test]
+fn a_non_object_root_schema_is_left_as_it_is() {
+    for schema in [
+        json!({"type": "string"}),
+        json!({"type": "array", "items": {"type": "string"}}),
+    ] {
+        let format = text_format_for(schema.clone(), Some(true));
+        assert_eq!(format["schema"], schema);
+    }
+}
+
+#[test]
+fn strict_schemas_close_every_object_inside() {
+    let format = text_format_for(
+        json!({
+            "type": "object",
+            "properties": {
+                "steps": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}}}},
+                "owner": {"anyOf": [{"type": "object", "properties": {"name": {"type": "string"}}}, {"type": "null"}]},
+                "open": {"type": "object", "additionalProperties": true}
+            },
+            "$defs": {"ref": {"type": "object", "properties": {"x": {"type": "number"}}}}
+        }),
+        Some(true),
+    );
+    let schema = &format["schema"];
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["steps"]["items"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        schema["properties"]["owner"]["anyOf"][0]["additionalProperties"],
+        false
+    );
+    assert!(schema["properties"]["owner"]["anyOf"][1]
+        .get("additionalProperties")
+        .is_none());
+    assert_eq!(schema["properties"]["open"]["additionalProperties"], true);
+    assert_eq!(schema["$defs"]["ref"]["additionalProperties"], false);
+    assert!(schema["properties"]["steps"]
+        .get("additionalProperties")
+        .is_none());
+}
+
+#[test]
+fn non_strict_schemas_only_close_the_root() {
+    let format = text_format_for(
+        json!({"type": "object", "properties": {"inner": {"type": "object", "properties": {}}}}),
+        None,
+    );
+    assert_eq!(format["schema"]["additionalProperties"], false);
+    assert!(format["schema"]["properties"]["inner"]
+        .get("additionalProperties")
+        .is_none());
+}
