@@ -589,8 +589,19 @@ impl Google {
         service_tier: Option<GoogleServiceTier>,
     ) -> Self {
         Self::with_client_and_vertex(
-            client, api_key, model, max_tokens, temperature, timeout_seconds,
-            system, top_p, top_k, json_schema, tools, service_tier, None,
+            client,
+            api_key,
+            model,
+            max_tokens,
+            temperature,
+            timeout_seconds,
+            system,
+            top_p,
+            top_k,
+            json_schema,
+            tools,
+            service_tier,
+            None,
         )
     }
 

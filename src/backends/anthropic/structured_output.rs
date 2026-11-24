@@ -110,9 +110,7 @@ pub(super) fn unsupported_native_construct(schema: &Value) -> Option<String> {
         Value::Bool(_) => Some("a boolean sub-schema (`true`/`false`)".to_string()),
         Value::Object(fields) => {
             if fields.is_empty() {
-                return Some(
-                    "an empty schema ({}) that accepts any JSON value".to_string(),
-                );
+                return Some("an empty schema ({}) that accepts any JSON value".to_string());
             }
             if let Some(additional) = fields.get("additionalProperties") {
                 if additional != &Value::Bool(false) {
@@ -137,7 +135,8 @@ pub(super) fn unsupported_native_construct(schema: &Value) -> Option<String> {
                     .get("properties")
                     .and_then(Value::as_object)
                     .is_some_and(|properties| !properties.is_empty());
-                let explicitly_closed = fields.get("additionalProperties") == Some(&Value::Bool(false));
+                let explicitly_closed =
+                    fields.get("additionalProperties") == Some(&Value::Bool(false));
                 if !has_named_properties && !explicitly_closed {
                     return Some(
                         "an object schema with no named properties that isn't explicitly \
@@ -148,8 +147,7 @@ pub(super) fn unsupported_native_construct(schema: &Value) -> Option<String> {
             }
             for key in SCHEMA_MAPS {
                 if let Some(Value::Object(children)) = fields.get(*key) {
-                    if let Some(reason) = children.values().find_map(unsupported_native_construct)
-                    {
+                    if let Some(reason) = children.values().find_map(unsupported_native_construct) {
                         return Some(reason);
                     }
                 }
@@ -303,7 +301,9 @@ mod tests {
         assert_eq!(adapted["properties"]["meta"]["additionalProperties"], false);
         // Non-object schemas are untouched.
         let string_schema = json!({"type": "string"});
-        assert!(adapt_schema(&string_schema).get("additionalProperties").is_none());
+        assert!(adapt_schema(&string_schema)
+            .get("additionalProperties")
+            .is_none());
     }
 
     #[test]
@@ -385,7 +385,8 @@ mod tests {
 
     #[test]
     fn prompt_instruction_does_not_require_a_json_object_for_non_object_roots() {
-        let instruction = schema_prompt_instruction(&json!({"type": "array", "items": {"type": "string"}}));
+        let instruction =
+            schema_prompt_instruction(&json!({"type": "array", "items": {"type": "string"}}));
         let lower = instruction.to_lowercase();
         assert!(lower.contains("json value"));
         assert!(!lower.contains("json object"));

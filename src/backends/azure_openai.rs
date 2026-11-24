@@ -20,14 +20,14 @@ use crate::{
     tts::TextToSpeechProvider,
     LLMProvider,
 };
-#[cfg(feature = "azure_openai")]
-use futures::{Stream, StreamExt};
 use crate::{
     chat::{ChatResponse, ToolChoice},
     FunctionCall, ToolCall,
 };
 use async_trait::async_trait;
 use either::*;
+#[cfg(feature = "azure_openai")]
+use futures::{Stream, StreamExt};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 
@@ -208,7 +208,10 @@ struct OpenAIEmbeddingRequest {
 struct AzureOpenAIChatRequest<'a> {
     model: &'a str,
     messages: Vec<AzureOpenAIChatMessage<'a>>,
-    #[serde(rename = "max_completion_tokens", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "max_completion_tokens",
+        skip_serializing_if = "Option::is_none"
+    )]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
@@ -897,8 +900,10 @@ fn create_azure_sse_stream_with_tools(
                             let line = line.trim_end();
                             if line.is_empty() {
                                 if !event_buffer.is_empty() {
-                                    match parse_azure_sse_chunk_with_tools(event_buffer, tool_states)
-                                    {
+                                    match parse_azure_sse_chunk_with_tools(
+                                        event_buffer,
+                                        tool_states,
+                                    ) {
                                         Ok(chunks) => results.extend(chunks.into_iter().map(Ok)),
                                         Err(e) => results.push(Err(e)),
                                     }
@@ -1022,10 +1027,10 @@ impl ChatProvider for AzureOpenAI {
             .join("chat/completions")
             .map_err(|e| LLMError::HttpError(e.to_string()))?;
 
-            if let Some(api_version) = &self.config.api_version {
-                url.query_pairs_mut()
-                    .append_pair("api-version", api_version);
-            }
+        if let Some(api_version) = &self.config.api_version {
+            url.query_pairs_mut()
+                .append_pair("api-version", api_version);
+        }
 
         log::info!("Azure OpenAI HTTP Request {}", url);
         let mut request = self
@@ -1366,10 +1371,10 @@ impl EmbeddingProvider for AzureOpenAI {
             .join("embeddings")
             .map_err(|e| LLMError::HttpError(e.to_string()))?;
 
-            if let Some(api_version) = &self.config.api_version {
-                url.query_pairs_mut()
-                    .append_pair("api-version", api_version);
-            }
+        if let Some(api_version) = &self.config.api_version {
+            url.query_pairs_mut()
+                .append_pair("api-version", api_version);
+        }
 
         let resp = self
             .client
@@ -1429,10 +1434,10 @@ impl ModelsProvider for AzureOpenAI {
             .join("models")
             .map_err(|e| LLMError::HttpError(e.to_string()))?;
 
-            if let Some(api_version) = &self.config.api_version {
-                url.query_pairs_mut()
-                    .append_pair("api-version", api_version);
-            }
+        if let Some(api_version) = &self.config.api_version {
+            url.query_pairs_mut()
+                .append_pair("api-version", api_version);
+        }
 
         let mut request = self.client.get(url).header("api-key", &self.config.api_key);
 
@@ -1474,8 +1479,7 @@ mod tests {
             if partial_json == "{\"city\":\"Paris\"}"
         ));
 
-        let finish =
-            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
+        let finish = r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
         let chunks = parse_azure_sse_chunk_with_tools(finish, &mut tool_states).unwrap();
         assert_eq!(chunks.len(), 2);
         assert!(matches!(

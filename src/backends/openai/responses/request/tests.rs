@@ -2,7 +2,6 @@ use super::*;
 use crate::backends::openai::OpenAITool;
 use crate::chat::{ChatMessage, FunctionTool, StructuredOutputFormat, Tool, ToolChoice};
 use crate::providers::openai_compatible::OpenAICompatibleProviderConfig;
-use crate::providers::openai_compatible::OpenAIResponseType;
 use reqwest::Url;
 use serde_json::json;
 
@@ -85,10 +84,71 @@ fn build_responses_request_maps_tools_and_text() {
     let tool = request.tools.as_ref().unwrap().first().unwrap();
     assert_function_tool(tool, "get_weather");
     assert!(request.tool_choice.is_some());
-    assert!(matches!(
-        request.text.as_ref().unwrap().format.response_type,
-        OpenAIResponseType::JsonSchema
-    ));
+    assert_eq!(
+        request.text.as_ref().unwrap().format.format_type,
+        "json_schema"
+    );
+}
+
+#[test]
+fn structured_output_is_a_flat_text_format() {
+    let mut config = base_config();
+    config.json_schema = Some(StructuredOutputFormat {
+        name: "plan".to_string(),
+        description: Some("The plan".to_string()),
+        schema: Some(serde_json::json!({
+            "type": "object",
+            "properties": {"steps": {"type": "array"}}
+        })),
+        strict: Some(true),
+    });
+    let message = ChatMessage::user().content("Hi").build();
+    let request = build_responses_request(ResponsesRequestParams {
+        config: &config,
+        messages: &[message],
+        tools: None,
+        stream: false,
+    })
+    .unwrap();
+
+    let body = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        body["text"]["format"],
+        serde_json::json!({
+            "type": "json_schema",
+            "name": "plan",
+            "description": "The plan",
+            "schema": {
+                "type": "object",
+                "properties": {"steps": {"type": "array"}},
+                "additionalProperties": false
+            },
+            "strict": true
+        })
+    );
+}
+
+#[test]
+fn structured_output_without_a_name_still_has_one() {
+    let mut config = base_config();
+    config.json_schema = Some(StructuredOutputFormat {
+        name: String::new(),
+        description: None,
+        schema: Some(serde_json::json!({"type": "object"})),
+        strict: None,
+    });
+    let message = ChatMessage::user().content("Hi").build();
+    let request = build_responses_request(ResponsesRequestParams {
+        config: &config,
+        messages: &[message],
+        tools: None,
+        stream: false,
+    })
+    .unwrap();
+
+    let body = serde_json::to_value(&request).unwrap();
+    assert_eq!(body["text"]["format"]["name"], "response");
+    assert!(body["text"]["format"].get("json_schema").is_none());
 }
 
 #[test]

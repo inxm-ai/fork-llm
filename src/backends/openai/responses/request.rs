@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::chat::{ChatMessage, Tool, ToolChoice};
 use crate::error::LLMError;
-use crate::providers::openai_compatible::{OpenAICompatibleProviderConfig, OpenAIResponseFormat};
+use crate::providers::openai_compatible::OpenAICompatibleProviderConfig;
 
 use super::super::OpenAITool;
 use super::input::{build_input_items, ResponsesInput};
@@ -41,7 +41,48 @@ pub struct ResponsesReasoning {
 
 #[derive(Serialize, Debug)]
 pub struct ResponsesTextConfig {
-    pub format: OpenAIResponseFormat,
+    pub format: ResponsesTextFormat,
+}
+
+/// `text.format` of the Responses API. Unlike chat completions'
+/// `response_format`, the schema's name, description, schema and strictness sit
+/// next to `type` instead of under a `json_schema` object; a request in the
+/// chat-completions shape is refused for the missing `text.format.name`.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct ResponsesTextFormat {
+    #[serde(rename = "type")]
+    pub format_type: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
+
+impl From<crate::chat::StructuredOutputFormat> for ResponsesTextFormat {
+    fn from(format: crate::chat::StructuredOutputFormat) -> Self {
+        // As for chat completions: objects must not allow other properties.
+        let schema = format.schema.map(|mut schema| {
+            if schema.is_object() && schema.get("additionalProperties").is_none() {
+                schema["additionalProperties"] = serde_json::json!(false);
+            }
+            schema
+        });
+        let name = if format.name.trim().is_empty() {
+            "response".to_string()
+        } else {
+            format.name
+        };
+        ResponsesTextFormat {
+            format_type: "json_schema".to_string(),
+            name,
+            description: format.description,
+            schema,
+            strict: format.strict,
+        }
+    }
 }
 
 pub struct ResponsesRequestParams<'a> {
@@ -147,7 +188,7 @@ fn build_request_text(
     json_schema: Option<&crate::chat::StructuredOutputFormat>,
 ) -> Option<ResponsesTextConfig> {
     json_schema.cloned().map(|schema| ResponsesTextConfig {
-        format: OpenAIResponseFormat::from(schema),
+        format: ResponsesTextFormat::from(schema),
     })
 }
 
