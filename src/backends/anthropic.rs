@@ -202,10 +202,7 @@ struct MessageContent<'a> {
 #[serde(tag = "type")]
 enum ImageSource<'a> {
     #[serde(rename = "base64")]
-    Base64 {
-        media_type: &'a str,
-        data: String,
-    },
+    Base64 { media_type: &'a str, data: String },
     #[serde(rename = "url")]
     Url { url: &'a str },
 }
@@ -639,7 +636,10 @@ impl Anthropic {
 
     /// Builds an owned system prompt with a schema instruction appended, for
     /// the prompt-based structured output fallback (see `with_structured_output`).
-    fn system_with_schema_instruction(system: &SystemPrompt, instruction: &str) -> OwnedSystemPrompt {
+    fn system_with_schema_instruction(
+        system: &SystemPrompt,
+        instruction: &str,
+    ) -> OwnedSystemPrompt {
         match system {
             SystemPrompt::String(s) => OwnedSystemPrompt::String(format!("{s}\n\n{instruction}")),
             SystemPrompt::Messages(msgs) => {
@@ -660,7 +660,9 @@ impl Anthropic {
         self.config
             .output_schema_instruction
             .as_deref()
-            .map(|instruction| Self::system_with_schema_instruction(&self.config.system, instruction))
+            .map(|instruction| {
+                Self::system_with_schema_instruction(&self.config.system, instruction)
+            })
     }
 
     /// Creates a new Anthropic client with the specified configuration.
@@ -795,9 +797,10 @@ impl Anthropic {
                 "Anthropic native structured output disabled - schema contains {reason}; \
                  falling back to prompt-based JSON output"
             );
-            let validator = Arc::new(jsonschema::JSONSchema::compile(&schema).map_err(
-                |error| LLMError::InvalidRequest(format!("Invalid Anthropic output schema: {error}")),
-            )?);
+            let validator =
+                Arc::new(jsonschema::JSONSchema::compile(&schema).map_err(|error| {
+                    LLMError::InvalidRequest(format!("Invalid Anthropic output schema: {error}"))
+                })?);
             config.output_config = None;
             config.output_validator = Some(validator);
             config.output_schema_instruction =
@@ -807,7 +810,9 @@ impl Anthropic {
             let validator = if wire_schema != schema {
                 Some(Arc::new(jsonschema::JSONSchema::compile(&schema).map_err(
                     |error| {
-                        LLMError::InvalidRequest(format!("Invalid Anthropic output schema: {error}"))
+                        LLMError::InvalidRequest(format!(
+                            "Invalid Anthropic output schema: {error}"
+                        ))
                     },
                 )?))
             } else {
@@ -1359,7 +1364,12 @@ pub(crate) fn create_anthropic_tool_stream(
     let stream = response
         .bytes_stream()
         .scan(
-            (String::new(), Vec::new(), HashMap::new(), AnthropicUsageState::default()),
+            (
+                String::new(),
+                Vec::new(),
+                HashMap::new(),
+                AnthropicUsageState::default(),
+            ),
             move |(buffer, utf8_buffer, tool_states, usage_state), chunk| {
                 let result = match chunk {
                     Ok(bytes) => {
@@ -1985,9 +1995,18 @@ mod tests {
     #[test]
     fn fallback_schema_instruction_is_appended_to_string_system_prompt() {
         let provider = Anthropic::new(
-            "test-key", None, None, None, None,
+            "test-key",
+            None,
+            None,
+            None,
+            None,
             Some(SystemPrompt::String("You are the planner.".into())),
-            None, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .with_structured_output(crate::chat::StructuredOutputFormat {
             name: "planner".into(),
@@ -1996,7 +2015,11 @@ mod tests {
             schema: Some(free_form_planner_schema()),
         })
         .unwrap();
-        let instruction = provider.config.output_schema_instruction.as_deref().unwrap();
+        let instruction = provider
+            .config
+            .output_schema_instruction
+            .as_deref()
+            .unwrap();
         let owned = Anthropic::system_with_schema_instruction(&provider.config.system, instruction);
         match owned {
             OwnedSystemPrompt::String(s) => {
@@ -2191,7 +2214,10 @@ data: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {
         assert_eq!(usage.prompt_tokens, 332);
         assert_eq!(usage.completion_tokens, 7);
         assert_eq!(usage.total_tokens, 339);
-        assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, Some(300));
+        assert_eq!(
+            usage.prompt_tokens_details.unwrap().cached_tokens,
+            Some(300)
+        );
     }
 
     #[test]
@@ -2243,7 +2269,9 @@ data: {"type": "message_delta", "delta": {"stop_reason": "tool_use"}}
             .await;
         assert!(matches!(&chunks[0], StreamChunk::Text(t) if t == "Hey"));
         assert!(matches!(&chunks[1], StreamChunk::Usage(u) if u.total_tokens == 15));
-        assert!(matches!(&chunks[2], StreamChunk::Done { stop_reason } if stop_reason == "end_turn"));
+        assert!(
+            matches!(&chunks[2], StreamChunk::Done { stop_reason } if stop_reason == "end_turn")
+        );
         assert_eq!(chunks.len(), 3);
     }
 
@@ -2707,7 +2735,10 @@ data: {"type": "ping"}
         let converted = Anthropic::convert_messages_to_anthropic(&messages);
         let json = serde_json::to_value(&converted).unwrap();
         assert_eq!(json[0]["content"][0]["type"], "document");
-        assert_eq!(json[0]["content"][0]["source"]["media_type"], "application/pdf");
+        assert_eq!(
+            json[0]["content"][0]["source"]["media_type"],
+            "application/pdf"
+        );
     }
 
     #[test]

@@ -48,7 +48,11 @@ async fn stream_tools(
     messages: &[ChatMessage],
 ) -> (Result<StreamOutcome, LLMError>, bool) {
     let tools = handle.provider.tools();
-    let mut stream = match handle.provider.chat_stream_with_tools(messages, tools).await {
+    let mut stream = match handle
+        .provider
+        .chat_stream_with_tools(messages, tools)
+        .await
+    {
         Ok(stream) => stream,
         Err(err) => return (Err(err), false),
     };

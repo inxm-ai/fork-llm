@@ -208,7 +208,11 @@ impl ChatResponse for VAResponse {
                 }
             })
             .collect();
-        if calls.is_empty() { None } else { Some(calls) }
+        if calls.is_empty() {
+            None
+        } else {
+            Some(calls)
+        }
     }
 
     fn usage(&self) -> Option<Usage> {
@@ -459,8 +463,7 @@ impl ChatProvider for VertexAI {
             .json(&req_body);
 
         if self.config.timeout_seconds > 0 {
-            request =
-                request.timeout(std::time::Duration::from_secs(self.config.timeout_seconds));
+            request = request.timeout(std::time::Duration::from_secs(self.config.timeout_seconds));
         }
 
         log::debug!("VertexAI request: POST {}", self.raw_predict_url());
@@ -517,8 +520,7 @@ impl ChatProvider for VertexAI {
             .json(&req_body);
 
         if self.config.timeout_seconds > 0 {
-            request =
-                request.timeout(std::time::Duration::from_secs(self.config.timeout_seconds));
+            request = request.timeout(std::time::Duration::from_secs(self.config.timeout_seconds));
         }
 
         let response = request.send().await?;
@@ -572,8 +574,7 @@ impl ChatProvider for VertexAI {
             .json(&req_body);
 
         if self.config.timeout_seconds > 0 {
-            request =
-                request.timeout(std::time::Duration::from_secs(self.config.timeout_seconds));
+            request = request.timeout(std::time::Duration::from_secs(self.config.timeout_seconds));
         }
 
         let response = request.send().await?;
@@ -586,7 +587,9 @@ impl ChatProvider for VertexAI {
             });
         }
 
-        Ok(crate::backends::anthropic::create_anthropic_tool_stream(response))
+        Ok(crate::backends::anthropic::create_anthropic_tool_stream(
+            response,
+        ))
     }
 }
 

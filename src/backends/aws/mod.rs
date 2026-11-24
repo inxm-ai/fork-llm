@@ -29,9 +29,8 @@ use tokio::sync::OnceCell;
 
 use crate::chat::{
     finish_reason_of, ChatMessage as LlmChatMessage, ChatProvider, StreamChoice,
-    StreamChunk as LlmStreamChunk,
-    StreamDelta, StreamResponse, StructuredOutputFormat, Tool as LlmTool,
-    ToolChoice as LlmToolChoice,
+    StreamChunk as LlmStreamChunk, StreamDelta, StreamResponse, StructuredOutputFormat,
+    Tool as LlmTool, ToolChoice as LlmToolChoice,
 };
 use crate::completion::{
     CompletionProvider, CompletionRequest as GenericCompletionRequest,

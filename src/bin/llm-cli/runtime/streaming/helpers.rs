@@ -26,10 +26,7 @@ impl<'a> EmittingSender<'a> {
         }
     }
 
-    pub async fn send(
-        &self,
-        event: AppEvent,
-    ) -> Result<(), mpsc::error::SendError<AppEvent>> {
+    pub async fn send(&self, event: AppEvent) -> Result<(), mpsc::error::SendError<AppEvent>> {
         self.emitted.store(true, Ordering::Relaxed);
         self.inner.send(event).await
     }
@@ -50,11 +47,7 @@ pub async fn flush_text_if_needed(
     }
 }
 
-pub async fn flush_text(
-    buffer: &mut String,
-    request: &StreamRequest,
-    sender: &EmittingSender<'_>,
-) {
+pub async fn flush_text(buffer: &mut String, request: &StreamRequest, sender: &EmittingSender<'_>) {
     if buffer.is_empty() {
         return;
     }
