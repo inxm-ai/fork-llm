@@ -63,11 +63,11 @@ pub struct ResponsesTextFormat {
 
 impl From<crate::chat::StructuredOutputFormat> for ResponsesTextFormat {
     fn from(format: crate::chat::StructuredOutputFormat) -> Self {
-        // As for chat completions: objects must not allow other properties.
+        // As for chat completions, an object root allows no other properties.
+        // Strict mode needs that of every object in the schema.
+        let strict = format.strict == Some(true);
         let schema = format.schema.map(|mut schema| {
-            if schema.is_object() && schema.get("additionalProperties").is_none() {
-                schema["additionalProperties"] = serde_json::json!(false);
-            }
+            close_objects(&mut schema, strict);
             schema
         });
         let name = if format.name.trim().is_empty() {
@@ -175,6 +175,46 @@ fn build_request_tool_choice(
         tool_choice.clone()
     } else {
         None
+    }
+}
+
+/// Adds `additionalProperties: false` to an object schema that does not say
+/// otherwise; with `nested`, also to the object schemas inside it.
+fn close_objects(schema: &mut serde_json::Value, nested: bool) {
+    let Some(map) = schema.as_object_mut() else {
+        return;
+    };
+    let is_object = map.get("type").is_some_and(|t| {
+        t == "object"
+            || t.as_array()
+                .is_some_and(|ts| ts.iter().any(|t| t == "object"))
+    }) || map.contains_key("properties");
+    if is_object && !map.contains_key("additionalProperties") {
+        map.insert("additionalProperties".to_string(), serde_json::json!(false));
+    }
+    if !nested {
+        return;
+    }
+    for key in ["properties", "$defs", "definitions", "patternProperties"] {
+        if let Some(children) = map.get_mut(key).and_then(|v| v.as_object_mut()) {
+            for child in children.values_mut() {
+                close_objects(child, true);
+            }
+        }
+    }
+    for key in ["items", "additionalItems", "not"] {
+        if let Some(child) = map.get_mut(key) {
+            if child.is_object() {
+                close_objects(child, true);
+            }
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(children) = map.get_mut(key).and_then(|v| v.as_array_mut()) {
+            for child in children {
+                close_objects(child, true);
+            }
+        }
     }
 }
 
