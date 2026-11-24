@@ -227,12 +227,79 @@ impl OpenAI {
         web_search_user_location_approximate_city: Option<String>,
         web_search_user_location_approximate_region: Option<String>,
     ) -> Result<Self, LLMError> {
+        let mut builder = reqwest::Client::builder();
+        if let Some(sec) = timeout_seconds {
+            builder = builder.timeout(Duration::from_secs(sec));
+        }
+        let client = builder
+            .build()
+            .map_err(|e| LLMError::HttpError(e.to_string()))?;
+        Self::with_client(
+            client,
+            api_key,
+            base_url,
+            model,
+            max_tokens,
+            temperature,
+            timeout_seconds,
+            system,
+            top_p,
+            top_k,
+            embedding_encoding_format,
+            embedding_dimensions,
+            tools,
+            tool_choice,
+            normalize_response,
+            reasoning_effort,
+            json_schema,
+            voice,
+            extra_body,
+            enable_web_search,
+            web_search_context_size,
+            web_search_user_location_type,
+            web_search_user_location_approximate_country,
+            web_search_user_location_approximate_city,
+            web_search_user_location_approximate_region,
+        )
+    }
+
+    /// Like [`OpenAI::new`], around a given HTTP client, so several providers
+    /// can share its connection pool (e.g. one per upstream in a gateway).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_client(
+        client: reqwest::Client,
+        api_key: impl Into<String>,
+        base_url: Option<String>,
+        model: Option<String>,
+        max_tokens: Option<u32>,
+        temperature: Option<f32>,
+        timeout_seconds: Option<u64>,
+        system: Option<String>,
+        top_p: Option<f32>,
+        top_k: Option<u32>,
+        embedding_encoding_format: Option<String>,
+        embedding_dimensions: Option<u32>,
+        tools: Option<Vec<Tool>>,
+        tool_choice: Option<ToolChoice>,
+        normalize_response: Option<bool>,
+        reasoning_effort: Option<String>,
+        json_schema: Option<StructuredOutputFormat>,
+        voice: Option<String>,
+        extra_body: Option<serde_json::Value>,
+        enable_web_search: Option<bool>,
+        web_search_context_size: Option<String>,
+        web_search_user_location_type: Option<String>,
+        web_search_user_location_approximate_country: Option<String>,
+        web_search_user_location_approximate_city: Option<String>,
+        web_search_user_location_approximate_region: Option<String>,
+    ) -> Result<Self, LLMError> {
         let api_key_str = api_key.into();
         if api_key_str.is_empty() {
             return Err(LLMError::AuthError("Missing OpenAI API key".to_string()));
         }
         Ok(OpenAI {
-            provider: <OpenAICompatibleProvider<OpenAIConfig>>::new(
+            provider: <OpenAICompatibleProvider<OpenAIConfig>>::with_client(
+                client,
                 api_key_str,
                 base_url,
                 model,
@@ -699,5 +766,105 @@ impl OpenAI {
             .send_and_parse_responses(&body, "OpenAI responses API")
             .await?;
         Ok(Box::new(response))
+    }
+}
+
+#[cfg(test)]
+mod with_client_tests {
+    use super::*;
+    use crate::chat::ChatProvider;
+
+    #[tokio::test]
+    async fn with_client_sends_through_the_given_client() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/responses")
+            .match_header("x-pool", "shared")
+            .match_header("authorization", "Bearer test-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "id": "resp_1", "object": "response", "status": "completed", "model": "m",
+                    "output": [{"type": "message", "id": "msg_1", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "pooled"}]}]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        // A header only this client sends tells its requests apart.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-pool", "shared".parse().unwrap());
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+        let provider = OpenAI::with_client(
+            client,
+            "test-key",
+            Some(format!("{}/v1/", server.url())),
+            Some("m".to_string()),
+            None,
+            None,
+            Some(30),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let message = crate::chat::ChatMessage::user().content("Hi").build();
+        let answer = provider.chat(&[message]).await.unwrap();
+        assert_eq!(answer.text().as_deref(), Some("pooled"));
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn with_client_needs_an_api_key() {
+        let result = OpenAI::with_client(
+            reqwest::Client::new(),
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(result, Err(LLMError::AuthError(_))));
     }
 }
